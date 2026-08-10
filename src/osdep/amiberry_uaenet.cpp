@@ -87,6 +87,7 @@ struct uaenet_data {
     int packetsinbuffer;
     bool prehandler;
     struct uaenet_queue *first, *last;
+    volatile int queue_dropped;
     bool closed;
     uae_sem_t change_sem;
     uae_sem_t sync_sem;
@@ -138,6 +139,8 @@ static uae_u16 compute_tcp_checksum(const uae_u8 *ip_hdr, int ip_hdr_len,
 }
 #endif
 
+extern void a2065_tap_log(const char *stage, const uae_u8 *d, int len);
+
 // Insert a single packet into the incoming queue (called from worker thread)
 static void uaenet_queue_one(struct uaenet_data *ud, const uae_u8 *data, int len)
 {
@@ -146,8 +149,22 @@ static void uaenet_queue_one(struct uaenet_data *ud, const uae_u8 *data, int len
     if (!ud || len <= 0 || len > MAX_FRAME_LEN)
         return;
 
+    a2065_tap_log("q", data, len);
+
     uae_sem_wait(&ud->queue_sem);
-    if (ud->packetsinbuffer > 50) {
+    /* The cap is a silent discard: nothing counts it and nothing logs it, so a
+       host burst deeper than this leaves as a lost segment and an RTO with no
+       trace anywhere.  uaenet_queue() above also splits a GRO-coalesced arrival
+       into individual frames, so one 64 KB super-packet becomes ~45 entries and
+       fills a 50-deep queue on its own.  AMIBERRY_A2065_QUEUE overrides it. */
+    static int qcap = -1;
+    if (qcap < 0) {
+        const char *e = getenv("AMIBERRY_A2065_QUEUE");
+        qcap = (e && atoi(e) > 0) ? atoi(e) : 50;
+    }
+    if (ud->packetsinbuffer > qcap) {
+        ud->queue_dropped++;
+        a2065_tap_log("Q-cap", data, len);
         uae_sem_post(&ud->queue_sem);
         return;
     }
@@ -365,6 +382,20 @@ static void uaenet_close_driver_internal(struct uaenet_data *ud)
 {
     if (!ud)
         return;
+
+    /* Where frames actually went.  ps_drop is the kernel giving up because the
+       capture buffer was full; ps_ifdrop is the interface itself; queue_dropped
+       is our own cap above.  All three were silent before this. */
+#ifdef WITH_UAENET_PCAP
+    if (ud->handle) {
+        struct pcap_stat ps;
+        memset(&ps, 0, sizeof(ps));
+        if (pcap_stats(ud->handle, &ps) == 0)
+            write_log(_T("UAENET: pcap recv=%u kernel_drop=%u if_drop=%u\n"),
+                      ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+    }
+#endif
+    write_log(_T("UAENET: queue_dropped=%d\n"), ud->queue_dropped);
 
     uaenet_request_worker_stop(ud);
 

@@ -323,6 +323,47 @@ static void log_packet(const uae_u8 *p, int size)
 	write_log("\n");
 }
 
+
+/* Per-frame receive tap: follows one frame from pcap to the receive ring so a
+   frame that never reaches the guest can be attributed to a stage.  Prints the
+   TCP sequence number, which is what a capture on the host NIC is keyed by.
+   Off unless AMIBERRY_A2065_TAP is set. */
+int a2065_tap_on(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("AMIBERRY_A2065_TAP");
+		on = (e && atoi(e)) ? 1 : 0;
+	}
+	return on;
+}
+
+void a2065_tap_log(const char *stage, const uae_u8 *d, int len)
+{
+	if (!a2065_tap_on() || !d || len < 54)
+		return;
+	if (d[12] != 0x08 || d[13] != 0x00)		/* IPv4 */
+		return;
+	const int ihl = (d[14] & 0x0f) * 4;
+	if (d[14 + 9] != 6 || ihl < 20)			/* TCP */
+		return;
+	const uae_u8 *t = d + 14 + ihl;
+	if (len < 14 + ihl + 20)
+		return;
+	const uae_u32 seq = ((uae_u32)t[4] << 24) | ((uae_u32)t[5] << 16) |
+			    ((uae_u32)t[6] << 8) | t[7];
+	const int sport = (t[0] << 8) | t[1];
+	const int dport = (t[2] << 8) | t[3];
+	const int doff = (t[12] >> 4) * 4;
+	const int totlen = (d[14 + 2] << 8) | d[14 + 3];
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	write_log(_T("A2065TAP %s %lu.%06lu %d>%d seq=%lu plen=%d\n"), stage,
+		  (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000),
+		  sport, dport, (unsigned long)seq,
+		  totlen - ihl - doff);
+}
+
 static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 {
 	int i;
@@ -335,6 +376,9 @@ static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 	const uae_u8 *dstmac, *srcmac;
 	struct s2devstruct *dev = (struct s2devstruct*)devv;
 
+	uae_u8 tap_frame[64];
+	const int tap_len = len < 64 ? len : 64;
+	memcpy(tap_frame, databuf, tap_len);
 	dstmac = databuf;
 	srcmac = databuf + 6;
 
@@ -346,8 +390,10 @@ static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 		log_packet(databuf, len);
 	}
 
-	if (!(csr[0] & CSR0_RXON)) // receiver off?
+	if (!(csr[0] & CSR0_RXON)) { // receiver off?
+		a2065_tap_log("x-rxoff", databuf, len);
 		return;
+	}
 	if (len < 20) { // too short
 		if (log_a2065)
 			write_log (_T("7990: short frame, %d bytes\n"), len);
@@ -494,6 +540,7 @@ static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 			break;
 	}
 
+	a2065_tap_log("r", tap_frame, tap_len);
 	csr[0] |= CSR0_RINT;
 	devices_rethink_all(rethink_a2065);
 }
@@ -579,6 +626,43 @@ static bool receive_space_available(int len)
 	return false;
 }
 
+/* Receive pacing.  A real A2065 takes frames off 10BASE-T, so the wire itself
+   is the flow control: one 1500-byte frame every 1.2 ms at most.  Nothing here
+   paced delivery, so a fast host hands the guest bursts it cannot recycle
+   receive descriptors for, and receive_queue_drain() below then drops them for
+   want of ring space -- invisibly, since that path does not set CSR0_MISS.
+   Credit accrues per scanline and is capped, so a short burst still passes as
+   it would on real wire.  Off unless AMIBERRY_A2065_KBIT is set. */
+static int rx_credit;
+static int rx_bytes_per_line = -1;
+
+static void a2065_rx_credit_tick(void)
+{
+	if (rx_bytes_per_line < 0) {
+		const char *s = getenv("AMIBERRY_A2065_KBIT");
+		const int kbit = s ? atoi(s) : 0;
+		/* Nominal PAL line rate.  A prototype knob, not a calibrated clock. */
+		rx_bytes_per_line = kbit > 0 ? (kbit * 1000 / 8) / 15625 : 0;
+		if (kbit > 0 && rx_bytes_per_line < 1)
+			rx_bytes_per_line = 1;
+	}
+	if (rx_bytes_per_line <= 0)
+		return;
+	rx_credit += rx_bytes_per_line;
+	if (rx_credit > MAX_PACKET_SIZE * 2)
+		rx_credit = MAX_PACKET_SIZE * 2;
+}
+
+static bool a2065_rx_credit_take(int len)
+{
+	if (rx_bytes_per_line <= 0)
+		return true;
+	if (rx_credit < len)
+		return false;
+	rx_credit -= len;
+	return true;
+}
+
 static void receive_queue_drain(void)
 {
 	uae_u8 packet[MAX_PACKET_SIZE];
@@ -588,13 +672,36 @@ static void receive_queue_drain(void)
 		if (len <= 0)
 			return;
 		if (!receive_packet_can_fit(len)) {
+			/* Wait, do not discard.  The guest has not recycled receive
+			   descriptors yet; it will.  This frame is already held in
+			   receive_buffer, which has RECEIVE_QUEUE_SIZE entries, so
+			   leaving it there costs nothing and the next hsync retries.
+			   Discarding it here is what turns a host-side burst into a
+			   lost segment and an RTO, on a path where the sender can put
+			   more in flight than the ring holds.  Set
+			   AMIBERRY_A2065_DROP_ON_FULL=1 for the old behaviour. */
+			static int drop_on_full = -1;
+			if (drop_on_full < 0) {
+				const char *e = getenv("AMIBERRY_A2065_DROP_ON_FULL");
+				drop_on_full = (e && atoi(e)) ? 1 : 0;
+			}
+			if (!drop_on_full)
+				return;
 			if (!receive_queue_pop(packet, &len))
 				return;
 			if (log_a2065)
 				write_log(_T("7990: dropping frame that does not fit receive ring, %d bytes\n"), len);
 			continue;
 		}
-		if (!receive_space_available(len))
+		if (!receive_space_available(len)) {
+			if (a2065_tap_on()) {
+				static unsigned long held;
+				if ((held++ % 5000) == 0)
+					write_log(_T("A2065TAP ringfull %lu\n"), (unsigned long)held);
+			}
+			return;
+		}
+		if (!a2065_rx_credit_take(len))
 			return;
 		if (!receive_queue_pop(packet, &len))
 			return;
@@ -615,10 +722,12 @@ static void gotfunc(void *devv, const uae_u8 *databuf, int len)
 	const int nextwrite = (receive_buffer_write + 1) & (RECEIVE_QUEUE_SIZE - 1);
 	if (nextwrite == receive_buffer_read) {
 		uae_sem_post(&receive_sem);
+		a2065_tap_log("X-qfull", databuf, len);
 		if (log_a2065)
 			write_log(_T("7990: receive queue full\n"));
 		return;
 	}
+	a2065_tap_log("g", databuf, len);
 	memcpy(receive_buffer + receive_buffer_write * MAX_PACKET_SIZE, databuf, len);
 	receive_buffer_size[receive_buffer_write] = len;
 	receive_buffer_write = nextwrite;
@@ -793,6 +902,7 @@ static void a2065_hsync_handler(void)
 	 * was left only draining its own buffer -- so received frames never arrived.
 	 * Without this, host->guest networking is dead (ping/telnet/ftp), while
 	 * guest->host TX still works. */
+	a2065_rx_credit_tick();
 	if (td != NULL)
 		ethernet_receive_poll(td, sysdata);
 	receive_queue_drain();
