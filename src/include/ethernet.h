@@ -36,6 +36,11 @@ extern void ethernet_close (struct netdriverdata *ndd, void*);
 extern void ethernet_trigger (struct netdriverdata *ndd, void*);
 extern void ethernet_receive_poll (struct netdriverdata *ndd, void*);
 
+/* Repair an offload-partial transport checksum in a just-captured frame.
+   Every emulated NIC's receive path calls this on its own copy of the frame;
+   see the definition in ethernet.cpp for why the capture path produces them. */
+extern void ethernet_fix_partial_csum(uae_u8 *frame, int len);
+
 extern bool ariadne2_init(struct autoconfig_info *aci);
 extern bool hydra_init(struct autoconfig_info *aci);
 extern bool lanrover_init(struct autoconfig_info *aci);

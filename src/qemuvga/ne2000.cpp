@@ -1264,6 +1264,7 @@ static void gotfunc(void *devv, const uae_u8 *databuf, int len)
 		return;
 	}
 	memcpy(receive_buffer + receive_buffer_write * MAX_PACKET_SIZE, databuf, len);
+	ethernet_fix_partial_csum(receive_buffer + receive_buffer_write * MAX_PACKET_SIZE, len);
 	receive_buffer_size[receive_buffer_write] = len;
 	receive_buffer_write++;
 	receive_buffer_write &= (MAX_RECEIVE_BUFFER_INDEX - 1);
