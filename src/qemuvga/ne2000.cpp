@@ -1216,6 +1216,11 @@ static void gotfunc(void *devv, const uae_u8 *databuf, int len)
 
 static void ne2000_hsync_handler(struct pci_board_state *pcibs)
 {
+	/* Amiberry's uaenet queues captured frames on the pcap worker thread and
+	 * calls gotfunc only when the emulation thread asks for them. Nothing asked
+	 * on behalf of an NE2000 board, so the queue was never drained.
+	 * a2065_hsync_handler does the same. */
+	ethernet_receive_poll(td, sysdata);
 	ne2000_receive_check();
 }
 
