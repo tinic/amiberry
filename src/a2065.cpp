@@ -364,6 +364,33 @@ void a2065_tap_log(const char *stage, const uae_u8 *d, int len)
 		  totlen - ihl - doff);
 }
 
+/* Transmit-direction tap: the frame the guest is putting on the wire, keyed by
+   the ACK number, which is what pairs it with the inbound data it covers. */
+static void a2065_tap_log_tx(const char *stage, const uae_u8 *d, int len)
+{
+	if (!a2065_tap_on() || !d || len < 54)
+		return;
+	if (d[12] != 0x08 || d[13] != 0x00)		/* IPv4 */
+		return;
+	const int ihl = (d[14] & 0x0f) * 4;
+	if (d[14 + 9] != 6 || ihl < 20)			/* TCP */
+		return;
+	const uae_u8 *t = d + 14 + ihl;
+	if (len < 14 + ihl + 20)
+		return;
+	const uae_u32 seq = ((uae_u32)t[4] << 24) | ((uae_u32)t[5] << 16) |
+			    ((uae_u32)t[6] << 8) | t[7];
+	const uae_u32 ack = ((uae_u32)t[8] << 24) | ((uae_u32)t[9] << 16) |
+			    ((uae_u32)t[10] << 8) | t[11];
+	const int sport = (t[0] << 8) | t[1];
+	const int dport = (t[2] << 8) | t[3];
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	write_log(_T("A2065TAP %s %lu.%06lu %d>%d ack=%lu seq=%lu\n"), stage,
+		  (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000),
+		  sport, dport, (unsigned long)ack, (unsigned long)seq);
+}
+
 static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 {
 	int i;
@@ -540,6 +567,18 @@ static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 			break;
 	}
 
+	if (a2065_tap_on()) {
+		/* Byte sum of the frame as handed to the ring copy, so a guest-side
+		   dump can prove or clear the emulator's receive path. */
+		unsigned long fs = 0;
+		for (i = 0; i < len; i++)
+			fs += tmp[i];
+		struct timespec fts;
+		clock_gettime(CLOCK_REALTIME, &fts);
+		write_log(_T("A2065TAP fsum %lu.%06lu len=%d sum=%08lx\n"),
+			  (unsigned long)fts.tv_sec,
+			  (unsigned long)(fts.tv_nsec / 1000), len, fs);
+	}
 	a2065_tap_log("r", tap_frame, tap_len);
 	csr[0] |= CSR0_RINT;
 	devices_rethink_all(rethink_a2065);
@@ -860,6 +899,7 @@ static void do_transmit (void)
 			}
 			log_packet(d, outsize);
 		}
+		a2065_tap_log_tx("t", d, outsize);
 		ethernet_trigger (td, sysdata);
 	}
 
@@ -1038,6 +1078,14 @@ static void chip_wput (uaecptr addr, uae_u16 v)
 			csr[0] &= ~t;
 			csr[0] &= ~CSR0_ERR;
 
+			if ((v & CSR0_TDMD) && a2065_tap_on()) {
+				struct timespec tdts;
+				clock_gettime(CLOCK_REALTIME, &tdts);
+				write_log(_T("A2065TAP td %lu.%06lu\n"),
+					  (unsigned long)tdts.tv_sec,
+					  (unsigned long)(tdts.tv_nsec / 1000));
+			}
+
 			if ((csr[0] & CSR0_STOP) && !(oreg & CSR0_STOP)) {
 
 				csr[0] = CSR0_STOP;
@@ -1203,10 +1251,32 @@ static uae_u8 a2065_bget2 (uaecptr addr)
 	return v;
 }
 
+/* Guest CPU write returning a receive descriptor to the LANCE: the byte that
+   carries RMD1's OWN bit, inside the receive ring, with OWN going to 1.  Every
+   CPU store into board RAM funnels through a2065_bput2(), so word and long
+   writes land here too; LANCE-side DMA uses put_ram_word() and is not seen. */
+static void a2065_tap_rmd_own(uae_u32 idx, uae_u32 v)
+{
+	if (!a2065_tap_on() || !am_initialized || !am_rdr_rlen)
+		return;
+	if (!(v & 0x80))
+		return;
+	if (idx < am_rdr_rdra || idx >= am_rdr_rdra + am_rdr_rlen * 8)
+		return;
+	if (((idx - am_rdr_rdra) & 7) != 2)
+		return;
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	write_log(_T("A2065TAP v %lu.%06lu slot=%lu\n"),
+		  (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000),
+		  (unsigned long)((idx - am_rdr_rdra) / 8));
+}
+
 static void a2065_bput2 (uaecptr addr, uae_u32 v)
 {
 	if (addr >= RAM_OFFSET) {
 		boardram[(addr & RAM_MASK)] = v;
+		a2065_tap_rmd_own(addr & RAM_MASK, v);
 	}
 }
 
