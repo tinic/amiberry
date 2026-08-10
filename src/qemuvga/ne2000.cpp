@@ -1161,18 +1161,43 @@ static volatile int receive_buffer_read, receive_buffer_write;
 static int receive_buffer_size[MAX_RECEIVE_BUFFER_INDEX];
 static uae_sem_t ne2000_sem;
 
+/* Retrying a frame the ring will not take is back-pressure while the driver is
+ * draining. Before the driver programs PSTART/PSTOP the ring is zero bytes long
+ * and ne2000_buffer_full() is true for every frame, so the queue head never
+ * retires and one frame captured before bring-up stalls receive for the rest of
+ * the session. Drop what arrives with the chip stopped or unprogrammed, and
+ * bound the retries for a running one. */
+#define NE2000_RECEIVE_RETRIES 512
+static int receive_retry;
+
+static void ne2000_receive_consume(void)
+{
+	receive_retry = 0;
+	receive_buffer_read++;
+	receive_buffer_read &= (MAX_RECEIVE_BUFFER_INDEX - 1);
+}
+
 static void ne2000_receive_check2(void)
 {
-	if (receive_buffer_read != receive_buffer_write) {
-		if (ne2000state.isr & ENISR_RX)
+	NE2000State *s = &ne2000state;
+	while (receive_buffer_read != receive_buffer_write) {
+		if ((s->cmd & E8390_STOP) || s->stop <= s->start) {
+			ne2000_receive_consume();
+			continue;
+		}
+		if (s->isr & ENISR_RX)
 			return;
-		if (ne2000_receive(&ncs, receive_buffer + receive_buffer_read * MAX_PACKET_SIZE, receive_buffer_size[receive_buffer_read]) < 0)
+		if (ne2000_receive(&ncs, receive_buffer + receive_buffer_read * MAX_PACKET_SIZE, receive_buffer_size[receive_buffer_read]) < 0) {
+			if (++receive_retry < NE2000_RECEIVE_RETRIES)
+				return;
+			ne2000_receive_consume();
 			return;
+		}
 #ifdef DEBUG_NE2000
 		write_log("NE2000: %d byte receive accepted (%d %d)\n", receive_buffer_size[receive_buffer_read], receive_buffer_read, receive_buffer_write);
 #endif
-		receive_buffer_read++;
-		receive_buffer_read &= (MAX_RECEIVE_BUFFER_INDEX - 1);
+		ne2000_receive_consume();
+		return;
 	}
 }
 
@@ -1256,6 +1281,7 @@ static void ne2000_reset(struct pci_board_state *pcibs)
 {
 	ne2000_reset2(&ne2000state);
 	receive_buffer_read = receive_buffer_write = 0;
+	receive_retry = 0;
 }
 
 static void ne2000_free(struct pci_board_state *pcibs)
