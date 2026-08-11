@@ -834,6 +834,12 @@ bool uae_mman_info(addrbank* ab, struct uae_mman_data* md)
 		got = true;
 		readonly = true;
 		maprom = true;
+    }
+	else if (!_tcscmp(ab->label, _T("rom_b0"))) {
+		start = 0xb00000;
+		got = true;
+		readonly = true;
+		maprom = true;
 	}
 	else if (!_tcscmp(ab->label, _T("rom_e0")))
 	{
@@ -1135,8 +1141,12 @@ void protect_roms(bool protect)
 {
 	if (protect) {
 		// protect only if JIT enabled, always allow unprotect
-		if (!currprefs.cachesize || currprefs.comptrustbyte || currprefs.comptrustword || currprefs.comptrustlong)
+		if (!currprefs.cachesize || currprefs.comptrustbyte || currprefs.comptrustword || currprefs.comptrustlong) {
 			return;
+		}
+		if (currprefs.rom_readwrite || rom_write_enabled) {
+			return;
+		}
 	}
 	for (auto & shmid : shmids) {
 		struct uae_shmid_ds *shm = &shmid;

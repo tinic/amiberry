@@ -8,8 +8,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.blitterstudio.amiberry.data.AppPreferences
 import com.blitterstudio.amiberry.data.ConfigGenerator
+import com.blitterstudio.amiberry.data.ConfigSettingsResolver
 import com.blitterstudio.amiberry.data.FileRepository
-import java.io.File
+import com.blitterstudio.amiberry.data.ShaderCatalog
 import com.blitterstudio.amiberry.data.model.AmigaFile
 import com.blitterstudio.amiberry.data.model.AmigaModel
 import com.blitterstudio.amiberry.data.model.EmulatorSettings
@@ -26,12 +27,18 @@ import com.blitterstudio.amiberry.data.ConfigRepository
 import com.blitterstudio.amiberry.data.ConfigurationSaveActions
 import com.blitterstudio.amiberry.data.WhdLoadAutoConfig
 import com.blitterstudio.amiberry.ui.hasTouchScreen
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
+	enum class ShaderCatalogStatus {
+		NOT_LOADED,
+		LOADING,
+		LOADED
+	}
 
 	private val repository = FileRepository.getInstance(application)
 	private val configRepository = ConfigRepository.getInstance(application)
@@ -40,7 +47,18 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 	var settings by mutableStateOf(EmulatorSettings())
 		private set
 
+	var shaderCatalogEntries by mutableStateOf(ShaderCatalog.BUILT_INS)
+		private set
+
+	var shaderCatalogStatus by mutableStateOf(ShaderCatalogStatus.NOT_LOADED)
+		private set
+
+	private var shaderCatalogRefreshGeneration = 0
+
 	var adjustmentNotices by mutableStateOf<List<SettingsAdjustmentNotice>>(emptyList())
+		private set
+
+	var selectedIntentPreset by mutableStateOf<SettingsIntentPreset?>(null)
 		private set
 
 	var currentUnknownLines by mutableStateOf<List<String>>(emptyList())
@@ -84,17 +102,49 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 		}
 	}
 
+	fun refreshShaderCatalog() {
+		val refreshGeneration = ++shaderCatalogRefreshGeneration
+		shaderCatalogStatus = ShaderCatalogStatus.LOADING
+
+		viewModelScope.launch {
+			val catalogEntries = withContext(Dispatchers.IO) {
+				val application = getApplication<Application>()
+				val externalFilesDir = application.getExternalFilesDir(null)
+				val settingsFile = ShaderCatalog.findSettingsFile(
+					application.filesDir,
+					externalFilesDir
+				)
+				val roots = ShaderCatalog.resolveScanRoots(
+					settingsFile,
+					externalFilesDir
+				)
+				ShaderCatalog.scan(roots)
+			}
+
+			if (refreshGeneration != shaderCatalogRefreshGeneration) return@launch
+			shaderCatalogEntries = catalogEntries
+			shaderCatalogStatus = ShaderCatalogStatus.LOADED
+		}
+	}
+
 	private fun restoreLastSession(): Boolean {
 		val context = getApplication<Application>()
+		val globalSettingsFile = ShaderCatalog.findSettingsFile(
+			context.filesDir,
+			context.getExternalFilesDir(null)
+		)
 		val sessionFile = ConfigGenerator.configFile(context, LAST_SESSION_FILE)
 		val legacySessionFile = ConfigGenerator.legacyExternalConfigFile(context, LAST_SESSION_FILE)
 		val readableSessionFile = when {
 			sessionFile.exists() -> sessionFile
 			legacySessionFile.exists() -> legacySessionFile
-			else -> return false
+			else -> {
+				settings = ConfigSettingsResolver.defaults(globalSettingsFile)
+				return false
+			}
 		}
 		try {
-			val parsed = ConfigParser.parse(readableSessionFile)
+			val parsed = ConfigSettingsResolver.parse(readableSessionFile, globalSettingsFile)
 			settings = appPreferences.applyRememberedAndroidControls(parsed.settings, parsed.explicitKeys)
 			currentUnknownLines = parsed.unknownLines
 			return true
@@ -115,11 +165,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 	}
 
 	fun applyModel(model: AmigaModel) {
+		selectedIntentPreset = null
 		val selectedRoms = ModelRomAvailability.selectRomsForModel(model, availableRoms.value)
 		val previousSettings = settings
 		val newSettings = EmulatorSettings.fromModel(model).copy(
 			romFile = selectedRoms.kick?.path.orEmpty(),
 			romExtFile = selectedRoms.ext?.path.orEmpty(),
+			shader = previousSettings.shader,
 			joyport0 = previousSettings.joyport0,
 			joyport1 = previousSettings.joyport1,
 			onScreenJoystick = previousSettings.onScreenJoystick,
@@ -132,6 +184,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 	}
 
 	fun loadConfig(parsed: ConfigParser.ParsedConfig, name: String, path: String) {
+		selectedIntentPreset = null
 		applyConstrainedSettings(
 			appPreferences.applyRememberedAndroidControls(parsed.settings, parsed.explicitKeys),
 			publishNotices = true
@@ -208,6 +261,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
 	/** Revert in-memory edits back to the last saved/loaded values of the open config. */
 	fun discardChanges() {
+		selectedIntentPreset = null
 		settings = baselineSettings
 		currentUnknownLines = baselineUnknownLines
 		clearAdjustmentNotices()
@@ -245,6 +299,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 			SettingsIntentPresets.apply(settings, preset),
 			publishNotices = true
 		)
+		selectedIntentPreset = preset.takeIf { SettingsIntentPresets.matches(settings, it) }
 		appPreferences.saveAndroidControls(settings)
 		saveLastSession()
 	}
@@ -265,6 +320,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 				)
 			} ?: return@launch
 
+			selectedIntentPreset = null
 			applyConstrainedSettings(detectedSettings, publishNotices = true)
 			appPreferences.saveAndroidControls(settings)
 			saveLastSession()
@@ -296,6 +352,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 	private fun applyConstrainedSettings(requested: EmulatorSettings, publishNotices: Boolean) {
 		val constrained = applyConstraints(requested)
 		settings = constrained
+		selectedIntentPreset = selectedIntentPreset?.takeIf {
+			SettingsIntentPresets.matches(constrained, it)
+		}
 		if (publishNotices) {
 			adjustmentNotices = SettingsAdjustmentNotices.fromAdjustment(requested, constrained)
 		}

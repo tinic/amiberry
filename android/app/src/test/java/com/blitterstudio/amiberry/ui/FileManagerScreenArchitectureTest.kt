@@ -1,6 +1,8 @@
 package com.blitterstudio.amiberry.ui
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -26,6 +28,72 @@ class FileManagerScreenArchitectureTest {
 	}
 
 	@Test
+	fun `import offers both file and recursive folder pickers for all categories`() {
+		val screen = source()
+
+		assertTrue(
+			"File Manager import should preserve batch selection.",
+			screen.contains("ActivityResultContracts.OpenMultipleDocuments()")
+		)
+		assertTrue(
+			"Users should be able to select a directory tree for any category.",
+			screen.contains("ActivityResultContracts.OpenDocumentTree()")
+		)
+		assertTrue(
+			"The selected folder should be imported through the view model for the current category.",
+			screen.contains("viewModel.importFolder(uri, currentCategory)")
+		)
+		assertTrue(screen.contains("R.string.action_import_files"))
+		assertFalse(
+			"File Manager should not reference the replaced ROM-file import label.",
+			screen.contains("R.string.action_import_rom_files")
+		)
+		assertTrue(screen.contains("R.string.action_import_folder"))
+	}
+
+	@Test
+	fun `import wording is generic across categories`() {
+		assertEquals("Import files", stringResourceValue("action_import_files"))
+		assertEquals("Import folder", stringResourceValue("action_import_folder"))
+		assertEquals("Import ROM", stringResourceValue("action_import_rom"))
+		assertNull(stringResourceValue("action_import_rom_files"))
+	}
+
+	@Test
+	fun `file list keeps its final row clear of the floating import action`() {
+		val screen = source()
+
+		assertTrue(
+			"LazyColumn should use weight(1f) to fill remaining vertical space.",
+			Regex("""LazyColumn\(\s*modifier = Modifier\.weight\(1f\)""").containsMatchIn(screen)
+		)
+		assertTrue(
+			"LazyColumn content should retain 16dp horizontal, 4dp top, and 80dp bottom scroll clearance.",
+			Regex(
+				"""contentPadding = PaddingValues\(\s*start = 16\.dp,\s*top = 4\.dp,\s*end = 16\.dp,\s*bottom = 80\.dp\s*\)"""
+			).containsMatchIn(screen)
+		)
+	}
+
+	@Test
+	fun `storage path is shown in top bar subtitle not a separate card`() {
+		val screen = source()
+
+		assertTrue(
+			"TopAppBar should show the storage path as a subtitle.",
+			screen.contains("viewModel.getStoragePath()")
+		)
+		assertFalse(
+			"The storage path OutlinedCard should be removed from the body.",
+			Regex("""OutlinedCard\([^{]*\{[^{]*getStoragePath""").containsMatchIn(screen)
+		)
+		assertTrue(
+			"A copy-path action should remain accessible from the top bar.",
+			screen.contains("clipboardLabelPath") && screen.contains("Icons.Default.ContentCopy")
+		)
+	}
+
+	@Test
 	fun `file manager does not mutate search state during composition`() {
 		val screen = source()
 
@@ -44,6 +112,17 @@ class FileManagerScreenArchitectureTest {
 	fun `file manager disables delete actions while scan or import is in progress`() {
 		val screen = source()
 
+		assertTrue(
+			"Each file row should retain its own delete callback.",
+			screen.contains("onDelete = { viewModel.deleteFile(file) }")
+		)
+		assertTrue(
+			"Delete should continue to require local confirmation state.",
+			screen.contains("var showDeleteDialog by remember { mutableStateOf(false) }") &&
+				screen.contains("if (showDeleteDialog)") &&
+				screen.contains("AlertDialog(") &&
+				screen.contains("onDelete()")
+		)
 		assertTrue(
 			"File list rows should receive the same busy state used by refresh/import controls.",
 			screen.contains("deleteEnabled = !showProgress")
@@ -87,4 +166,12 @@ class FileManagerScreenArchitectureTest {
 
 	private fun source(): String =
 		File("src/main/java/com/blitterstudio/amiberry/ui/screens/FileManagerScreen.kt").readText()
+
+	private fun stringResourceValue(name: String): String? {
+		val strings = File("src/main/res/values/strings.xml").readText()
+		return Regex("""<string name="$name">([^<]*)</string>""")
+			.find(strings)
+			?.groupValues
+			?.get(1)
+	}
 }

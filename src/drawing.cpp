@@ -433,6 +433,7 @@ typedef void (*LINETOSRC_FUNC)(void);
 static LINETOSRC_FUNC lts;
 static bool lts_changed, lts_request;
 typedef void (*LINETOSRC_FUNCF)(int,int,int,int,int,int,int,int,uae_u32,uae_u8**,uae_u8**,int,int*,int,struct linestate*);
+static int lts_hres_shift;
 
 static int denise_hcounter, denise_hcounter_next, denise_hcounter_new, denise_hcounter_prev, denise_hcounter_cmp;
 static bool denise_accurate_mode;
@@ -550,7 +551,7 @@ static int denise_y_start, denise_y_end;
 
 static int denise_pixtotal, denise_pixtotalv, denise_linecnt, denise_startpos, denise_cck, denise_endcycle;
 static int denise_pixtotalskip_start, denise_pixtotalskip_end, denise_hdelay;
-static int denise_pixtotal_max;
+static int denise_pixtotal_max, denise_pixtotal_totalmax;
 static uae_u32 *buf1, *buf2, *buf_d;
 static uae_u8 *gbuf;
 static uae_u8 pixx0, pixx1, pixx2, pixx3;
@@ -672,6 +673,110 @@ extern bool lof_display;
 
 static int gclow, gcloh, gclox, gcloy, gclorealh;
 static int stored_left_start, stored_top_start, stored_width, stored_height;
+
+#ifdef AMIBERRY
+static bool autoscale_sprite_left_edge;
+static bool autoscale_sprite_right_edge;
+static int autoscale_sprite_zero_firstword = 30000;
+static int autoscale_sprite_zero_lastword;
+#endif
+
+static void update_diwfirstword_total(const int firstword)
+{
+#ifdef AMIBERRY
+	if (firstword <= diwfirstword_total) {
+		autoscale_sprite_left_edge = false;
+	}
+#endif
+	if (firstword < diwfirstword_total) {
+		diwfirstword_total = firstword;
+	}
+}
+
+static void update_diwlastword_total(const int lastword)
+{
+#ifdef AMIBERRY
+	if (lastword >= diwlastword_total) {
+		autoscale_sprite_right_edge = false;
+	}
+#endif
+	if (lastword > diwlastword_total) {
+		diwlastword_total = lastword;
+	}
+}
+
+#ifdef AMIBERRY
+int get_autoscale_sprite_horizontal_edges(void)
+{
+	int edges = 0;
+	if (autoscale_sprite_left_edge) {
+		edges |= AUTOSCALE_SPRITE_EDGE_LEFT;
+	}
+	if (autoscale_sprite_right_edge) {
+		edges |= AUTOSCALE_SPRITE_EDGE_RIGHT;
+	}
+	return edges;
+}
+
+static void get_autoscale_horizontal_limits(const int firstword, const int lastword,
+	int* left, int* right)
+{
+	const int skip = denise_hdelay << (RES_MAX + 1);
+	int diwfirst = firstword + skip;
+	int diwlast = lastword + skip;
+	if (!firstword || !lastword) {
+		diwfirst = ddffirstword_total << (RES_MAX + 1);
+		diwlast = ddflastword_total << (RES_MAX + 1);
+	}
+
+	if (doublescan <= 0 && !programmedmode
+		&& currprefs.gfx_overscanmode < OVERSCANMODE_EXTREME) {
+		const int min = 92 << RES_MAX;
+		const int max = 460 << RES_MAX;
+		diwfirst = std::max(diwfirst, min);
+		diwlast = std::min(diwlast, max);
+	}
+
+	int x = diwfirst - (hdisplay_left_border << (RES_MAX + 1)) + (1 << RES_MAX);
+	const int width = (diwlast - diwfirst) >> hresolution_inv;
+	x >>= hresolution_inv;
+	x = std::max(x, 0);
+	*left = x;
+	*right = x + width;
+}
+
+int get_autoscale_sprite_zero_horizontal_edges(int* left, int* right)
+{
+	if (!left || !right) {
+		return 0;
+	}
+
+	int source_left;
+	int source_right;
+	get_autoscale_horizontal_limits(diwfirstword_total, diwlastword_total,
+		&source_left, &source_right);
+	get_autoscale_horizontal_limits(
+		std::min(diwfirstword_total, autoscale_sprite_zero_firstword),
+		std::max(diwlastword_total, autoscale_sprite_zero_lastword), left, right);
+
+	int edges = 0;
+	if (*left < source_left) {
+		edges |= AUTOSCALE_SPRITE_EDGE_LEFT;
+	}
+	if (*right > source_right) {
+		edges |= AUTOSCALE_SPRITE_EDGE_RIGHT;
+	}
+	return edges;
+}
+
+void reset_autoscale_sprite_horizontal_edges(void)
+{
+	autoscale_sprite_left_edge = false;
+	autoscale_sprite_right_edge = false;
+	autoscale_sprite_zero_firstword = 30000;
+	autoscale_sprite_zero_lastword = 0;
+}
+#endif
 
 void get_custom_topedge (int *xp, int *yp, bool max)
 {
@@ -919,6 +1024,13 @@ void store_custom_limits(int w, int h, int x, int y)
 		currprefs.gfx_filter_autoscale);
 #endif
 }
+
+#ifdef AMIBERRY
+bool custom_limits_are_provisional(void)
+{
+	return plffirstline_total >= 30000;
+}
+#endif
 
 int get_custom_limits(int *pw, int *ph, int *pdx, int *pdy, int *prealh, int *hres, int *vres)
 {
@@ -4575,9 +4687,15 @@ static void autoscale_sprites(void)
 #if AUTOSCALE_SPRITES
 	if (diwfirstword_total > internal_pixel_cnt && internal_pixel_cnt > (48 << RES_MAX)) {
 		diwfirstword_total = internal_pixel_cnt;
+#ifdef AMIBERRY
+		autoscale_sprite_left_edge = true;
+#endif
 	}
 	if (diwlastword_total < internal_pixel_cnt && internal_pixel_cnt < (448 << RES_MAX)) {
 		diwlastword_total = internal_pixel_cnt;
+#ifdef AMIBERRY
+		autoscale_sprite_right_edge = true;
+#endif
 	}
 	if (this_line->linear_vpos < plffirstline_total) {
 		plffirstline_total = this_line->linear_vpos;
@@ -4587,6 +4705,23 @@ static void autoscale_sprites(void)
 	}
 #endif
 }
+
+#ifdef AMIBERRY
+static void track_autoscale_sprite_zero(void)
+{
+#if AUTOSCALE_SPRITES
+	// Sprite 0 remains excluded from autoscale_sprites(), but native AutoCrop
+	// needs its would-be edge to distinguish pointer motion from raster content.
+	if (internal_pixel_cnt > (48 << RES_MAX)
+		&& internal_pixel_cnt < (448 << RES_MAX)) {
+		autoscale_sprite_zero_firstword = std::min(
+			autoscale_sprite_zero_firstword, internal_pixel_cnt);
+		autoscale_sprite_zero_lastword = std::max(
+			autoscale_sprite_zero_lastword, internal_pixel_cnt);
+	}
+#endif
+}
+#endif
 
 static void get_shres_spr_pix(uae_u32 sv0, uae_u32 sv1, uae_u32 *dpix0, uae_u32 *dpix1)
 {
@@ -4640,6 +4775,9 @@ static uae_u32 denise_render_sprites_aga(int add)
 	uae_u32 v = 0;
 	uae_u32 d = 0;
 	bool asp = false;
+#ifdef AMIBERRY
+	bool sprite_zero_autoscale = false;
+#endif
 	int sidx = 0;
 	while (dprspts[sidx]) {
 		struct denise_spr *sp = dprspts[sidx];
@@ -4659,6 +4797,12 @@ static uae_u32 denise_render_sprites_aga(int add)
 				d |= 1 << num;
 			} else if (num > 0) {
 				asp = true;
+#ifdef AMIBERRY
+			} else {
+				const uae_u32 render_mask = magic_sprite_mask & debug_sprite_mask & 3;
+				sprite_zero_autoscale = ((render_mask & 1) && sp->dataas64)
+					|| ((render_mask & 2) && sp->databs64);
+#endif
 			}
 			sp->pix = ((sp->dataas64 >> 63) & 1) << 0;
 			sp->pix |= ((sp->databs64 >> 63) & 1) << 1;
@@ -4680,6 +4824,11 @@ static uae_u32 denise_render_sprites_aga(int add)
 		// only sprites 1-7
 		autoscale_sprites();
 	}
+#ifdef AMIBERRY
+	if (sprite_zero_autoscale && !denise_blank_active && !sprites_hidden) {
+		track_autoscale_sprite_zero();
+	}
+#endif
 	return v;
 }
 
@@ -5478,6 +5627,24 @@ void end_draw_denise(void)
 	}
 }
 
+static void set_pixtotal_max(void)
+{
+	denise_pixtotal_max = denise_pixtotal_totalmax;
+	if (buf1) {
+		int maxw = addrdiff((uae_u32*)xlinebuffer_end, (uae_u32*)xlinebuffer) >> lts_hres_shift;
+		int resw = denise_pixtotal_max;
+		if (resw > maxw) {
+			denise_pixtotal_max = maxw;
+		}
+		int xshift = linetoscr_x_adjust >> lts_hres_shift;
+		if (xshift > 0) {
+			denise_pixtotal_max -= xshift * 2;
+		}
+	} else {
+		denise_pixtotal_max = -0x7fffffff;
+	}
+}
+
 // emulate black level calibration (vb and hb)
 static uae_u8 blc_prev[3];
 static void emulate_black_level_calibration(uae_u32 *b1, uae_u32 *b2, uae_u32 *db, int dtotal, int cstart, int clen)
@@ -5705,17 +5872,17 @@ static void get_line(int monid, int gfx_ypos, enum nln_how how, int lol_shift_pr
 	struct vidbuf_description *vidinfo = &adisplays[monid].gfxvidinfo;
 	struct vidbuffer *vb = vidinfo->inbuffer;
 	int eraselines = 0;
-	int xshift = 0;
 
 	xlinebuffer = NULL;
 	xlinebuffer2 = NULL;
 	xlinebuffer_genlock = NULL;
 
-	denise_pixtotal_max = (denise_pixtotalv - denise_pixtotalskip_end) * 2;
+	denise_pixtotal_totalmax = (denise_pixtotalv - denise_pixtotalskip_end) * 2;
 	denise_pixtotal = -denise_pixtotalskip_start;
 
 	if (!vb->locked) {
-		denise_pixtotal_max = -0x7fffffff;
+		denise_pixtotal_totalmax = -0x7fffffff;
+		denise_pixtotal_max = denise_pixtotal_totalmax;
 		return;
 	}
 
@@ -5771,7 +5938,7 @@ static void get_line(int monid, int gfx_ypos, enum nln_how how, int lol_shift_pr
 				break;
 		}
 		setxlinebuffer(0, gfx_ypos);
-		xshift = linetoscr_x_adjust >> hresolution;
+		int xshift = linetoscr_x_adjust >> lts_hres_shift;
 		denise_pixtotal -= xshift;
 	}
 
@@ -5811,20 +5978,7 @@ static void get_line(int monid, int gfx_ypos, enum nln_how how, int lol_shift_pr
 		}
 	}
 
-	if (buf1) {
-		int maxw = addrdiff((uae_u32*)xlinebuffer_end, buf1);
-		if ((denise_pixtotal_max << hresolution) > maxw) {
-			denise_pixtotal_max = maxw >> hresolution;
-		}
-	}
-
-	if (xshift > 0) {
-		denise_pixtotal_max -= xshift * 2;
-	}
-	if (!buf1) {
-		denise_pixtotal_max = -0x7fffffff;
-	}
-
+	set_pixtotal_max();
 }
 
 static void draw_denise_vsync(int erase)
@@ -6396,6 +6550,8 @@ static void select_lts(void)
 		bm = CMODE_NORMAL;
 	}
 
+	lts_hres_shift = hresolution;
+
 	if (aga_mode) {
 
 		int spr = 0;
@@ -6505,6 +6661,8 @@ static void select_lts(void)
 	}
 	lts_request = false;
 	denise_hcounter_prev = denise_hcounter;
+
+	set_pixtotal_max();
 }
 
 STATIC_INLINE uae_u8 getbpl_aga(void)

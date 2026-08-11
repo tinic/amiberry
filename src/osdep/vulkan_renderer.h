@@ -47,6 +47,8 @@ public:
 	// Texture / shader allocation (Phase 2: stubs)
 	bool alloc_texture(int monid, int w, int h) override;
 	void set_scaling(int monid, const uae_prefs* p, int w, int h) override;
+	// The render thread does not yet expose geometry for the captured FrameSlot.
+	bool supports_actionable_screenshot() const override { return false; }
 
 	// VSync
 	void update_vsync(int monid) override;
@@ -164,7 +166,11 @@ private:
 		SDL_Rect crop{};
 		int crop_display_width = 0;
 		int crop_display_height = 0;
+		bool native_auto_crop = false;
 		bool integer_scaling = false;
+		bool auto_scaling = false;
+		bool stretch_to_fill = false;
+		bool linear_filter = false;
 		bool picasso_on = false;
 		bool screen_is_picasso = false;
 		int scalepicasso = 0;
@@ -230,11 +236,15 @@ private:
 	VmaAllocation m_upload_texture_allocation = nullptr;
 	VkImageView m_upload_texture_view = VK_NULL_HANDLE;
 	VkExtent2D m_upload_texture_extent = {0, 0};
+	// Vulkan samplers are immutable, so both filters are created up front and the
+	// matching descriptor set is bound per frame instead of recreating a sampler.
 	VkSampler m_upload_texture_sampler = VK_NULL_HANDLE;
+	VkSampler m_upload_texture_sampler_linear = VK_NULL_HANDLE;
 
 	VkDescriptorSetLayout m_texture_descriptor_set_layout = VK_NULL_HANDLE;
 	VkDescriptorPool m_texture_descriptor_pool = VK_NULL_HANDLE;
 	VkDescriptorSet m_texture_descriptor_set = VK_NULL_HANDLE;
+	VkDescriptorSet m_texture_descriptor_set_linear = VK_NULL_HANDLE;
 
 	VkPipelineLayout m_graphics_pipeline_layout = VK_NULL_HANDLE;
 	VkShaderModule m_vertex_shader_module = VK_NULL_HANDLE;
@@ -263,6 +273,7 @@ private:
 	bool m_logged_zero_extent_skip = false;
 	bool m_integer_scaling = false;
 	bool m_linear_filter = false;
+	bool m_stretch_to_fill = false;
 	uint32_t m_current_frame = 0;
 
 	// --- Generic overlay texture (reusable for bezel, cursor, vkbd, joystick) ---

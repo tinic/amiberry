@@ -219,9 +219,12 @@ static int isromext(const std::string& path, bool deepscan)
 		return 0;
 	const std::string ext = path.substr(ext_pos + 1);
 
-	static const std::vector<std::string> extensions = { "rom", "ROM", "roz", "ROZ", "bin", "BIN",  "a500", "A500", "a600", "A600", "a1200", "A1200", "a3000", "A3000", "a4000", "A4000", "cdtv", "CDTV", "cd32", "CD32" };
-	if (std::find(extensions.begin(), extensions.end(), ext) != extensions.end())
-		return 1;
+	static const std::vector<std::string> extensions = { "rom", "bin", "a500", "a600", "a1200", "a3000", "a4000", "cdtv", "cd32", "roz" };
+	for (const auto& extension : extensions)
+	{
+		if (strcasecmp(ext.c_str(), extension.c_str()) == 0)
+			return 1;
+	}
 
 	if (ext.size() >= 2 && std::toupper(ext[0]) == 'U' && std::isdigit(ext[1]))
 		return 1;
@@ -785,6 +788,23 @@ static void gui_to_prefs(void)
 
 	fixup_prefs(&changed_prefs, true);
 	updatewinfsmode(0, &changed_prefs);
+
+#ifdef AMIBERRY
+	// Screen-mode changes must survive the async config-check round trip: if
+	// anything re-syncs changed_prefs from currprefs before the check runs
+	// (e.g. a GUI re-entry via prefs_to_gui), the pending switch would be
+	// silently dropped. Apply the mode to currprefs now and force a display
+	// change so the window is recreated either way.
+	if (changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen != currprefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen ||
+		changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen != currprefs.gfx_apmode[APMODE_RTG].gfx_fullscreen) {
+		currprefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen = changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen;
+		currprefs.gfx_apmode[APMODE_RTG].gfx_fullscreen = changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen;
+		currprefs.gfx_monitor[0].gfx_size_win = changed_prefs.gfx_monitor[0].gfx_size_win;
+		currprefs.gfx_monitor[0].gfx_size_fs = changed_prefs.gfx_monitor[0].gfx_size_fs;
+		updatewinfsmode(0, &currprefs);
+		gfx_DisplayChangeRequested(2);
+	}
+#endif
 }
 
 static void after_leave_gui()
@@ -960,11 +980,13 @@ void gui_display(int shortcut)
 		target_graphics_buffer_update(mon->monitor_id, true);
 	}
 #if defined(_WIN32) || defined(__ANDROID__)
-	// After GUI close on shared-window platforms (Windows, Android) where the
-	// OpenGL context was reused by ImGui, the emulation shaders were destroyed
-	// in prepare_gui_sharing(). Force shader recreation + an immediate buffer
-	// refresh so the emulator frame replaces the last GUI frame on resume
-	// (otherwise the GUI image lingers while audio already plays).
+	// After GUI close on platforms where the OpenGL context was reused by
+	// ImGui (shared-window: Android/KMSDRM; or separate-window: Windows
+	// where the GL context was temporarily moved to the GUI window), the
+	// emulation shaders were destroyed in prepare_gui_sharing(). Force
+	// shader recreation + an immediate buffer refresh so the emulator frame
+	// replaces the last GUI frame on resume (otherwise the GUI image
+	// lingers while audio already plays).
 	if (g_renderer && g_renderer->has_context() && amiga_surface != nullptr)
 	{
 		target_graphics_buffer_update(mon->monitor_id, true);
@@ -1803,14 +1825,13 @@ void DisplayDiskInfo(int num)
 	struct diskinfo di {};
 	char tmp1[MAX_DPATH];
 	std::vector<std::string> infotext;
-	char title[MAX_DPATH];
 	char nameonly[MAX_DPATH];
 	char linebuffer[512];
 
 	DISK_examine_image(&changed_prefs, num, &di, true, nullptr, 0);
 	DISK_validate_filename(&changed_prefs, changed_prefs.floppyslots[num].df, num, tmp1, 0, nullptr, nullptr, nullptr);
 	extract_filename(tmp1, nameonly);
-	snprintf(title, MAX_DPATH - 1, "Info for %s", nameonly);
+	const std::string title = std::string("Info for ") + nameonly;
 
 	snprintf(linebuffer, sizeof(linebuffer) - 1, "Disk readable: %s", di.unreadable ? _T("No") : _T("Yes"));
 	infotext.emplace_back(linebuffer);
@@ -1853,7 +1874,7 @@ void DisplayDiskInfo(int num)
 		linebuffer[w * 3 + 1 + w] = 0;
 		infotext.emplace_back(linebuffer);
 	}
-	ShowDiskInfo(title, infotext);
+	ShowDiskInfo(title.c_str(), infotext);
 }
 
 void save_mapping_to_file(const std::string& mapping)

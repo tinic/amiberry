@@ -142,28 +142,32 @@ bool SDLRenderer::alloc_texture(int monid, int w, int h)
 	return m_amiga_texture != nullptr;
 }
 
-// Helper to decide between Linear (smooth) and Nearest Neighbor (pixelated) scaling
-static bool ar_is_exact(const SDL_DisplayMode* mode, const int width, const int height)
-{
-	return mode->w % width == 0 && mode->h % height == 0;
-}
-
 void SDLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
 {
 	AmigaMonitor* mon = &AMonitors[monid];
 	if (currprefs.headless) return;
+	amiberry_gui_geometry_invalidate(monid);
+	m_scaling_width = w;
+	m_scaling_height = h;
 
 	SDL_ScaleMode scale_mode = SDL_SCALEMODE_NEAREST;
 	bool integer_scale = false;
+	bool auto_scale = false;
+	bool stretch_to_fill = false;
 
 	switch (p->scaling_method) {
 	case -1: // Auto
-		if (!ar_is_exact(&sdl_mode, w, h))
-			scale_mode = SDL_SCALEMODE_LINEAR;
+		scale_mode = SDL_SCALEMODE_LINEAR;
+		auto_scale = !mon->screen_is_picasso;
 		break;
 	case 0: scale_mode = SDL_SCALEMODE_NEAREST; break;
 	case 1: scale_mode = SDL_SCALEMODE_LINEAR; break;
 	case 2: scale_mode = SDL_SCALEMODE_NEAREST; integer_scale = true; break;
+	// Stretch applies to native modes only; RTG has its own scaling modes.
+	case 3:
+		scale_mode = SDL_SCALEMODE_LINEAR;
+		stretch_to_fill = !mon->screen_is_picasso;
+		break;
 	default: scale_mode = SDL_SCALEMODE_LINEAR; break;
 	}
 
@@ -175,7 +179,7 @@ void SDLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
 		int output_width = 0;
 		int output_height = 0;
 		SDL_GetCurrentRenderOutputSize(mon->amiga_renderer, &output_width, &output_height);
-		float desired_aspect = ((currprefs.gfx_auto_crop || currprefs.gfx_manual_crop) && crop_aspect > 0.0f)
+		float desired_aspect = (crop_aspect > 0.0f)
 			? crop_aspect : calculate_desired_aspect(mon);
 		desired_aspect = amiberry_gfx_fullscreen_framebuffer_aspect(desired_aspect,
 			output_width, output_height, mon->desktop_width, mon->desktop_height);
@@ -186,6 +190,24 @@ void SDLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
 	}
 #endif
 
+	if (auto_scale && logical_width > 0 && logical_height > 0) {
+		int output_width = 0;
+		int output_height = 0;
+		SDL_GetCurrentRenderOutputSize(mon->amiga_renderer, &output_width, &output_height);
+		if (output_width <= 0 || output_height <= 0) {
+			output_width = sdl_mode.w;
+			output_height = sdl_mode.h;
+		}
+		const float desired_aspect = static_cast<float>(logical_width) / logical_height;
+		int auto_width = 0;
+		int auto_height = 0;
+		integer_scale = amiberry_gfx_auto_integer_dimensions(
+			output_width, output_height, logical_width, logical_width, logical_height,
+			false, desired_aspect, desired_aspect, auto_width, auto_height);
+		if (integer_scale)
+			scale_mode = SDL_SCALEMODE_NEAREST;
+	}
+
 	// SDL3: scale mode is per-texture, set on the amiga texture
 	if (m_amiga_texture)
 		SDL_SetTextureScaleMode(m_amiga_texture, scale_mode);
@@ -193,8 +215,44 @@ void SDLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
 	// SDL3: integer scaling via logical presentation mode
 	if (integer_scale)
 		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
+	else if (stretch_to_fill)
+		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_STRETCH);
 	else
 		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+}
+
+void SDLRenderer::set_auto_crop_presentation(const int monid, const int scaling_method,
+	const bool auto_integer_scaling, const int width, const int height)
+{
+	AmigaMonitor* mon = &AMonitors[monid];
+	amiberry_gui_geometry_invalidate(monid);
+	const bool integer_scaling = scaling_method == 2
+		|| (scaling_method == -1 && auto_integer_scaling);
+	const bool stretch_to_fill = scaling_method == 3;
+	const SDL_ScaleMode scale_mode = scaling_method == 0 || integer_scaling
+		? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR;
+
+	if (m_amiga_texture)
+		SDL_SetTextureScaleMode(m_amiga_texture, scale_mode);
+	SDL_SetRenderLogicalPresentation(mon->amiga_renderer, width, height,
+		integer_scaling ? SDL_LOGICAL_PRESENTATION_INTEGER_SCALE
+			: stretch_to_fill ? SDL_LOGICAL_PRESENTATION_STRETCH
+				: SDL_LOGICAL_PRESENTATION_LETTERBOX);
+}
+
+void SDLRenderer::refresh_scaling_after_resize(const int monid)
+{
+	AmigaMonitor* mon = &AMonitors[monid];
+	if (currprefs.scaling_method != -1 || mon->screen_is_picasso)
+		return;
+
+	if (currprefs.gfx_auto_crop) {
+		force_auto_crop = true;
+		return;
+	}
+
+	if (m_scaling_width > 0 && m_scaling_height > 0)
+		set_scaling(monid, &currprefs, m_scaling_width, m_scaling_height);
 }
 
 // --- OSD texture synchronization ---
@@ -287,6 +345,17 @@ bool SDLRenderer::render_frame(int monid, int mode, int immediate)
             }
         }
 
+		const AmiberryGfxRect source{
+			static_cast<int>(f_crop.x), static_cast<int>(f_crop.y),
+			static_cast<int>(f_crop.w), static_cast<int>(f_crop.h)
+		};
+		const AmiberryGfxRect viewport{
+			static_cast<int>(f_quad.x), static_cast<int>(f_quad.y),
+			static_cast<int>(f_quad.w), static_cast<int>(f_quad.h)
+		};
+		amiberry_gui_geometry_publish(monid, source, viewport,
+			AmiberryGuiViewportSpace::SdlRendererLogical, 0, 0, "sdl");
+
         SDL_RenderTextureRotated(mon->amiga_renderer, m_amiga_texture, &f_crop, &f_quad, 0, nullptr, SDL_FLIP_NONE);
 
 
@@ -319,15 +388,25 @@ bool SDLRenderer::render_frame(int monid, int mode, int immediate)
 		if ((((currprefs.leds_on_screen & STATUSLINE_CHIPSET) && !ad->picasso_on) ||
 			 ((currprefs.leds_on_screen & STATUSLINE_RTG) && ad->picasso_on)) && mon->statusline_texture)
 		{
-			int slx, sly, dst_w, dst_h;
-			SDL_GetRenderLogicalPresentation(mon->amiga_renderer, &dst_w, &dst_h, nullptr);
-			if (dst_w == 0 || dst_h == 0) {
-				SDL_GetCurrentRenderOutputSize(mon->amiga_renderer, &dst_w, &dst_h);
-			}
-			statusline_getpos(monid, &slx, &sly, dst_w, dst_h);
-			SDL_FRect dst_osd = { static_cast<float>(slx), static_cast<float>(sly),
-				static_cast<float>(mon->statusline_surface->w), static_cast<float>(mon->statusline_surface->h) };
-			SDL_RenderTexture(mon->amiga_renderer, mon->statusline_texture, nullptr, &dst_osd);
+		// WinUAE parity: the status line is an unscaled overlay positioned in
+		// output pixels. Temporarily bypass the logical presentation transform
+		// used for the scaled Amiga image.
+		int slx, sly, out_w, out_h;
+		SDL_GetCurrentRenderOutputSize(mon->amiga_renderer, &out_w, &out_h);
+		statusline_getpos(monid, &slx, &sly, out_w, out_h);
+		// statusline_getpos positions the LED bar (TD_TOTAL_HEIGHT * mult),
+		// but the surface also carries a message area above it. Anchor the
+		// LED bar at the returned position and let the message extend up.
+		const int led_h = TD_TOTAL_HEIGHT * (statusline_get_multiplier(monid) / 100);
+		SDL_FRect dst_osd = { static_cast<float>(slx),
+			static_cast<float>(sly - (mon->statusline_surface->h - led_h)),
+			static_cast<float>(mon->statusline_surface->w), static_cast<float>(mon->statusline_surface->h) };
+		int lw = 0, lh = 0;
+		SDL_LogicalPresentation lmode = SDL_LOGICAL_PRESENTATION_DISABLED;
+		SDL_GetRenderLogicalPresentation(mon->amiga_renderer, &lw, &lh, &lmode);
+		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+		SDL_RenderTexture(mon->amiga_renderer, mon->statusline_texture, nullptr, &dst_osd);
+		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, lw, lh, lmode);
 		}
 
 		render_vkbd(monid);

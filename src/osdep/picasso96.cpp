@@ -233,8 +233,6 @@ static void destroy_p96_host_cursor()
 		p96_cursor = nullptr;
 	}
 	clear_host_cursor_hotspot_compensation();
-	reset_native_cursor_hotspot_tracker();
-	reset_p96_cursor_hotspot_tracker();
 }
 #endif
 
@@ -2300,7 +2298,7 @@ static int createwindowscursor(int monid, int set, int chipset)
 		}
 		int hiressprite = sprite_0_width / 16;
 		int ds = h * ((w + 15) / 16) * 4;
-		if (!sprite_0 || !mousehack_alive() || w > CURSORMAXWIDTH || h > CURSORMAXHEIGHT || !valid_address(src, ds)) {
+		if (!sprite_0 || w > CURSORMAXWIDTH || h > CURSORMAXHEIGHT || !valid_address(src, ds)) {
 			goto exit;
 		}
 		int yy = 0;
@@ -4604,7 +4602,7 @@ static uae_u32 REGPARAM2 picasso_BlitPattern(TrapContext *ctx)
 	const auto Mask = static_cast<uae_u8>(trap_get_dreg(ctx, 4));
 	const auto RGBFmt = static_cast<uae_u8>(trap_get_dreg(ctx, 7));
 	int Bpp = GetBytesPerPixel (RGBFmt);
-	int inversion = 0;
+	uae_u16 inversion = 0;
 	struct RenderInfo ri{};
 	struct Pattern pattern;
 	uae_u8 *uae_mem;
@@ -4629,8 +4627,9 @@ static uae_u32 REGPARAM2 picasso_BlitPattern(TrapContext *ctx)
 		Bpp = GetBytesPerPixel(ri.RGBFormat);
 		uae_mem = ri.Memory + Y * ri.BytesPerRow + X * Bpp; /* offset with address */
 
-		if (pattern.DrawMode & INVERS)
-			inversion = 1;
+		if (pattern.DrawMode & INVERS) {
+			inversion = 0xffff;
+		}
 
 		pattern.DrawMode &= 0x03;
 
@@ -4659,7 +4658,7 @@ static uae_u32 REGPARAM2 picasso_BlitPattern(TrapContext *ctx)
 
 		for (int rows = 0; rows < H; rows++, uae_mem += ri.BytesPerRow) {
 			const uae_u32 prow = (rows + pattern.YOffset) & ysize_mask;
-			unsigned int d;
+			uae_u16 d;
 			uae_u8 *uae_mem2 = uae_mem;
 
 			if (indirect) {
@@ -4674,7 +4673,7 @@ static uae_u32 REGPARAM2 picasso_BlitPattern(TrapContext *ctx)
 			for (int cols = 0; cols < W; cols += 16, uae_mem2 += Bpp * 16) {
 				int bits;
 				int max = static_cast<int>(W) - cols;
-				uae_u32 data = d;
+				uae_u16 data = d ^ inversion;
 
 				max = std::min(max, 16);
 
@@ -4685,8 +4684,6 @@ static uae_u32 REGPARAM2 picasso_BlitPattern(TrapContext *ctx)
 						for (bits = 0; bits < max; bits++) {
 							int bit_set = data & 0x8000;
 							data <<= 1;
-							if (inversion)
-								bit_set = !bit_set;
 							if (bit_set)
 								PixelWrite(uae_mem2, bits, fgpen, Bpp, Mask);
 						}
@@ -4697,8 +4694,6 @@ static uae_u32 REGPARAM2 picasso_BlitPattern(TrapContext *ctx)
 						for (bits = 0; bits < max; bits++) {
 							int bit_set = data & 0x8000;
 							data <<= 1;
-							if (inversion)
-								bit_set = !bit_set;
 							PixelWrite(uae_mem2, bits, bit_set ? fgpen : bgpen, Bpp, Mask);
 						}
 						break;
@@ -5572,6 +5567,23 @@ static void copyrow(int monid, uae_u8 *src, uae_u8 *dst, int x, int y, int width
 	}
 
 	if (dy < 0 || dy >= state->Height) {
+		return;
+	}
+
+	// Guard against writing past the destination buffer.  vidinfo->maxwidth
+	// and maxheight are set by gfx_lock_picasso2 from the current surface
+	// dimensions.  If the RTG board's internal mode (state->Width/Height)
+	// is larger than the surface — e.g. during a mode switch where the
+	// surface hasn't been recreated yet — clamp the write to the surface
+	// bounds to prevent heap corruption (issue #2266).
+	if (vidinfo->maxwidth > 0 && dx + width > vidinfo->maxwidth) {
+		width = vidinfo->maxwidth - dx;
+		if (width <= 0) {
+			return;
+		}
+		endx = x + width;
+	}
+	if (vidinfo->maxheight > 0 && dy >= vidinfo->maxheight) {
 		return;
 	}
 
