@@ -131,13 +131,6 @@ void close_hwnds(struct AmigaMonitor* mon, const bool force_destroy_fullwindow)
 	{
 #if defined(__ANDROID__)
 		// Reuse existing window
-#elif defined(_WIN32)
-		if (mon->gui_window == mon->amiga_window) {
-			// GUI is sharing this window — don't destroy
-		} else {
-			SDL_DestroyWindow(mon->amiga_window);
-			mon->amiga_window = nullptr;
-		}
 #else
 		SDL_DestroyWindow(mon->amiga_window);
 		mon->amiga_window = nullptr;
@@ -475,6 +468,14 @@ void close_windows(struct AmigaMonitor* mon, const bool force_destroy_fullwindow
 		reset_sound();
 
 #ifdef AMIBERRY
+	// Reset drawbuffer state that may point into the surface pixel buffer
+	// before destroying the surface (see doInit for the full explanation).
+	avidinfo->drawbuffer.bufmem = nullptr;
+	avidinfo->drawbuffer.width_allocated = 0;
+	avidinfo->drawbuffer.height_allocated = 0;
+	avidinfo->drawbuffer.rowbytes = 0;
+	avidinfo->drawbuffer.locked = false;
+
 	if (mon->monitor_id == 0) {
 		SDL_DestroySurface(amiga_surface);
 		amiga_surface = nullptr;
@@ -711,6 +712,19 @@ static int create_windows(struct AmigaMonitor* mon)
 		} else if (md && md->display_id) {
 			SDL_Rect db;
 			SDL_GetDisplayBounds(md->display_id, &db);
+			// Leaving desktop fullscreen: the current position is the fullscreen
+			// origin, so restore the stored windowed position instead.
+			if (SDL_GetWindowFlags(mon->amiga_window) & SDL_WINDOW_FULLSCREEN) {
+				int stored_x = 1, stored_y = 0;
+				regqueryint(nullptr, _T("MainPosX"), &stored_x);
+				regqueryint(nullptr, _T("MainPosY"), &stored_y);
+				if (currprefs.borderless) {
+					stored_x = currprefs.gfx_monitor[mon->monitor_id].gfx_size_win.x;
+					stored_y = currprefs.gfx_monitor[mon->monitor_id].gfx_size_win.y;
+				}
+				nx = std::max(stored_x, 0);
+				ny = std::max(stored_y, 0);
+			}
 			bool on_target = (nx >= db.x && nx < db.x + db.w
 				&& ny >= db.y && ny < db.y + db.h);
 			if (!on_target) {
@@ -747,6 +761,16 @@ static int create_windows(struct AmigaMonitor* mon)
 					needs_resize = true;
 					write_log(_T("fullwindow: forcing mode switch from exclusive to desktop fullscreen\n"));
 				}
+			}
+		} else {
+			// Leaving desktop fullscreen through the resize-in-place path: SDL
+			// defers size/position changes on fullscreen windows, so without an
+			// explicit exit the window would silently stay fullscreen.
+			SDL_WindowFlags wflags = SDL_GetWindowFlags(mon->amiga_window);
+			if (wflags & SDL_WINDOW_FULLSCREEN) {
+				SDL_SetWindowFullscreen(mon->amiga_window, false);
+				SDL_SyncWindow(mon->amiga_window);
+				needs_resize = true;
 			}
 		}
 
@@ -948,6 +972,8 @@ static int create_windows(struct AmigaMonitor* mon)
 	if (renderer_to_use && mon->amiga_window) {
 		int win_w, win_h, draw_w, draw_h;
 		SDL_GetWindowSize(mon->amiga_window, &win_w, &win_h);
+		mon->logical_window_width = win_w;
+		mon->logical_window_height = win_h;
 		renderer_to_use->get_drawable_size(mon->amiga_window, &draw_w, &draw_h);
 		if (win_w > 0 && draw_w > 0 && win_w != draw_w) {
 			mon->hidpi_scale_x = (float)draw_w / (float)win_w;
@@ -1233,6 +1259,22 @@ bool doInit(AmigaMonitor* mon)
 	{
 		if (surface_ref)
 		{
+			// The drawbuffer's vram_buffer mode stores bufmem/width_allocated/
+			// height_allocated/rowbytes as direct references into the surface's
+			// pixel buffer (set by lockscr).  Reset those fields before freeing
+			// the surface so no stale pointers or dimensions survive the
+			// reallocation.  Without this, a subsequent flush_clear_screen or
+			// unlockscr dirty-rect calculation can use the old (larger)
+			// dimensions against the new (smaller) surface, overflowing the
+			// pixel buffer and corrupting heap metadata — the
+			// "free(): invalid next size" crash when switching between RTG
+			// (e.g. ZZ9000) and native PAL modes (issue #2266).
+			avidinfo->drawbuffer.bufmem = nullptr;
+			avidinfo->drawbuffer.width_allocated = 0;
+			avidinfo->drawbuffer.height_allocated = 0;
+			avidinfo->drawbuffer.rowbytes = 0;
+			avidinfo->drawbuffer.locked = false;
+
 			SDL_DestroySurface(surface_ref);
 			surface_ref = nullptr;
 		}

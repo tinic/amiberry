@@ -30,6 +30,13 @@ extern void graphics_leave(void);
 extern void graphics_reset(bool);
 extern bool handle_events(void);
 extern int handle_msgpump(bool);
+#if defined(AMIBERRY) && defined(USE_IPC_SOCKET)
+extern bool amiberry_send_mouse_abs(int x, int y);
+extern bool amiberry_send_mouse_abs_to_monitor(int monid, int x, int y);
+#endif
+#ifdef AMIBERRY_MACOS
+extern void flush_macos_synthetic_mouse_releases();
+#endif
 extern void setup_brkhandler(void);
 extern int isfullscreen(void);
 extern void toggle_fullscreen(int monid, int);

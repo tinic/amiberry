@@ -1758,6 +1758,7 @@ void compute_framesync(void)
 		vblank_hz = vblank_hz_shf;
 	}
 
+	draw_denise_line_queue_flush();
 	set_drawbuffer();
 	struct vidbuffer *vb = vidinfo->inbuffer;
 
@@ -1871,6 +1872,8 @@ static void init_beamcon0(void)
 	int isntsc, islace;
 	int hpos = current_hpos();
 	int oldmaxhpos = maxhpos;
+
+	draw_denise_line_queue_flush();
 
 	beamcon0 = new_beamcon0;
 
@@ -5246,6 +5249,13 @@ static void handle_nosignal(void)
 		resetfulllinestate();
 		if (!nosignal_cnt) {
 			denise_clearbuffers();
+			vsync_lines = maxvpos + lof_store;
+			agnus_vsync_start = get_cck_cycles();
+			linear_vpos_prev[2] = vsync_lines;
+			linear_vpos_prev[1] = vsync_lines;
+			linear_vpos_prev[0] = vsync_lines;
+			check_display_mode_change();
+			vsync_check_vsyncmode();
 		}
 		if (!ad->specialmonitoron) {
 			if (currprefs.gfx_monitorblankdelay > 0) {
@@ -5490,6 +5500,10 @@ static void reset_autoscale(void)
 	ddffirstword_total_old = ddffirstword_total;
 	ddflastword_total_old = ddflastword_total;
 
+#ifdef AMIBERRY
+	reset_autoscale_sprite_horizontal_edges();
+#endif
+
 	//write_log("%4d %4d %4d %4d %4d %4d\n", diwfirstword_total, diwlastword_total, ddffirstword_total, ddflastword_total, plffirstline_total, plflastline_total);
 
 	first_planes_vpos = 0;
@@ -5531,7 +5545,9 @@ static void hsync_handler_pre(bool onvsync)
 		/* reset light pen latch */
 		if (agnus_vb_active_end_line) {
 			lightpen_triggered = 0;
+			#ifndef AMIBERRY
 			sprite_0 = 0;
+			#endif
 		}
 
 		if (!lightpen_triggered && (bplcon0 & 8)) {
@@ -7673,9 +7689,9 @@ static int REGPARAM2 custom_wput_1(uaecptr addr, uae_u32 value, int noget)
 		} else {
 			int reg = addr & 0x1fe;
 			if (aga_mode) {
-				custom_wput_dma64(reg, NULL, v, c);
+				custom_wput_dma64(reg, static_cast<uaecptr>(NULL), v, c);
 			} else {
-				write_drga(reg, NULL, v);
+				write_drga(reg, static_cast<uaecptr>(NULL), v);
 			}
 		}
 	}
@@ -12240,6 +12256,9 @@ static void sync_imm_evhandler(void)
 	custom_trigger_start();
 
 	do_imm_dmal();
+
+	int diff = ((int)(get_cycles() - eventtab[ev_sync].oldcycles)) / CYCLE_UNIT;
+	currcycle_cck += diff;
 
 	start_sync_imm_handler();
 }

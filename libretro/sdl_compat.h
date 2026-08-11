@@ -538,6 +538,8 @@ typedef union SDL_Event {
 	SDL_DropEvent drop;
 } SDL_Event;
 
+typedef bool (SDLCALL *SDL_EventFilter)(void* userdata, SDL_Event* event);
+
 #define cbutton gbutton
 #define caxis gaxis
 
@@ -612,6 +614,7 @@ typedef struct SDL_GamepadBinding {
 
 enum {
 	SDL_EVENT_QUIT = 0x100,
+	SDL_EVENT_TERMINATING = 0x101,
 	SDL_EVENT_WILL_ENTER_BACKGROUND = 0x103,
 	SDL_EVENT_DID_ENTER_BACKGROUND = 0x104,
 	SDL_EVENT_WILL_ENTER_FOREGROUND = 0x105,
@@ -650,6 +653,7 @@ enum {
 	SDL_EVENT_FINGER_DOWN = 0x700,
 	SDL_EVENT_FINGER_UP,
 	SDL_EVENT_FINGER_MOTION,
+	SDL_EVENT_FINGER_CANCELED,
 	SDL_EVENT_CLIPBOARD_UPDATE = 0x900,
 	SDL_EVENT_DROP_FILE = 0x1000
 };
@@ -897,6 +901,7 @@ int SDL_SetCurrentThreadPriority(SDL_ThreadPriority pri);
 
 SDL_Surface* SDL_CreateSurface(int w, int h, SDL_PixelFormat format);
 SDL_Surface* SDL_CreateSurfaceFrom(int w, int h, SDL_PixelFormat format, void* pixels, int pitch);
+SDL_Surface* SDL_DuplicateSurface(SDL_Surface* surface);
 void SDL_DestroySurface(SDL_Surface* s);
 const SDL_PixelFormatDetails* SDL_GetPixelFormatDetails(SDL_PixelFormat format);
 bool SDL_BlitSurface(SDL_Surface* src, const SDL_Rect* sr, SDL_Surface* dst, const SDL_Rect* dr);
@@ -920,6 +925,7 @@ bool SDL_RenderSetScale(SDL_Renderer* renderer, float scaleX, float scaleY);
 bool SDL_SetRenderScale(SDL_Renderer* renderer, float scaleX, float scaleY);
 void SDL_RenderGetLogicalSize(SDL_Renderer* renderer, int* w, int* h);
 bool SDL_GetCurrentRenderOutputSize(SDL_Renderer* renderer, int* w, int* h);
+bool SDL_RenderCoordinatesToWindow(SDL_Renderer* renderer, float x, float y, float* window_x, float* window_y);
 bool SDL_RenderPresent(SDL_Renderer* renderer);
 bool SDL_RenderClear(SDL_Renderer* renderer);
 void SDL_DestroyRenderer(SDL_Renderer* renderer);
@@ -982,6 +988,7 @@ void SDL_GL_ResetAttributes(void);
 
 bool SDL_PushEvent(SDL_Event* event);
 bool SDL_PollEvent(SDL_Event* event);
+bool SDL_SetEventFilter(SDL_EventFilter filter, void* userdata);
 void SDL_PumpEvents(void);
 int SDL_PeepEvents(SDL_Event* events, int numevents, int action, Uint32 minType, Uint32 maxType);
 

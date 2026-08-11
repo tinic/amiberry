@@ -149,6 +149,10 @@
     <string name="setup_required_title">ROM Setup Required</string>
     <string name="setup_required_message">An Amiga Kickstart ROM is required to start the emulator. Please import a valid ROM file.</string>
     <string name="action_import_rom">Import ROM</string>
+    <string name="action_import_roms">Import ROMs</string>
+    <string name="action_import_rom_folder">Import ROM folder</string>
+    <string name="action_import_files">Import files</string>
+    <string name="action_import_folder">Import folder</string>
     <string name="file_manager_import_category">Import %1$s</string>
     <string name="configurations_empty_cta">Create Initial Configuration</string>
     <string name="quick_start_amiga_model">Amiga Model</string>
@@ -188,6 +192,7 @@
     <string name="msg_imported_multiple">Imported %1$d of %2$d files</string>
     <string name="msg_imported_multiple_with_failures">Imported %1$d of %2$d files (%3$d unsupported, %4$d failed)</string>
     <string name="msg_imported_none">No files imported (%1$d unsupported, %2$d failed)</string>
+    <string name="msg_import_folder_no_supported_files">No supported files found in the selected folder</string>
     <string name="msg_import_failed">Import failed</string>
     <string name="msg_intent_imported_config_as">Imported config as %1$s</string>
     <string name="msg_intent_imported_file">Imported %1$s</string>
@@ -271,6 +276,11 @@
     <string name="settings_display_dynamic_color">Use Material You colors</string>
     <string name="settings_display_integer_scaling">Integer Scaling</string>
     <string name="settings_display_integer_scaling_desc">Pixel-perfect scaling. Sets the scaling method to Integer and turns Resolution Autoswitch to Always On.</string>
+    <string name="settings_display_shader_label">Native Shader</string>
+    <string name="settings_display_shader_help">Applies to native Amiga display modes. RTG screens are unaffected.</string>
+    <string name="settings_display_shader_unavailable">Unavailable</string>
+    <string name="settings_display_shader_unavailable_value">%1$s — %2$s</string>
+    <string name="settings_display_shader_unavailable_help">The configured shader is unavailable. Choose another shader or restore its file.</string>
 
     <string name="settings_sound_title">Sound Settings</string>
     <string name="settings_sound_output_label">Sound Output</string>

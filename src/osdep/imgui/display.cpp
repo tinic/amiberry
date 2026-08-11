@@ -6,11 +6,39 @@
 #include "imgui_panels.h"
 #include "gui/gui_handling.h"
 #include "gfxboard.h"
+#include "play_setup.h"
+
+const ComboOption scaling_method_options[] = {
+    {-1, "Auto"},
+    {0, "Nearest"},
+    {1, "Linear"},
+    {2, "Integer"},
+    {3, "Stretch"},
+};
+const int scaling_method_option_count = IM_ARRAYSIZE(scaling_method_options);
+
+int scaling_method_to_index(const int scaling_method) {
+    for (int i = 0; i < scaling_method_option_count; i++) {
+        if (scaling_method_options[i].value == scaling_method)
+            return i;
+    }
+    return 0; // Auto
+}
 
 void render_panel_display() {
     ImGui::Indent(4.0f);
 
     const bool kmsdrm = kmsdrm_detected;
+#ifdef __ANDROID__
+    constexpr bool fullscreen_only = true;
+#else
+    const bool fullscreen_only = kmsdrm;
+#endif
+
+    if (fullscreen_only) {
+        changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen = GFX_FULLWINDOW;
+        changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen = GFX_FULLWINDOW;
+    }
 
     // Logic Check: RTG Enabled
     // WinUAE: ((!address_space_24 || configtype==2) && size) || type >= HARDWARE
@@ -54,8 +82,8 @@ void render_panel_display() {
                 ? Displays[current_display - 1].monitorname : "Primary")) {
                 for (int i = 0; i < display_count; i++) {
                     char label[256];
-                    snprintf(label, sizeof(label), "%s%s", Displays[i].monitorname,
-                        Displays[i].primary ? " (Primary)" : "");
+                    snprintf(label, sizeof(label), "%s%s##disp%d", Displays[i].monitorname,
+                        Displays[i].primary ? " (Primary)" : "", i);
                     bool is_selected = (current_display == i + 1);
                     if (ImGui::Selectable(label, is_selected)) {
                         changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_display = i + 1;
@@ -83,7 +111,7 @@ void render_panel_display() {
     }
 
     // Windowed & Buffering
-    if (kmsdrm) ImGui::BeginDisabled();
+    if (fullscreen_only) ImGui::BeginDisabled();
     ImGui::AlignTextToFramePadding();
     ImGui::Text("Windowed:");
     ImGui::SameLine(BUTTON_WIDTH);
@@ -105,7 +133,7 @@ void render_panel_display() {
     AmigaCheckbox("Borderless", &changed_prefs.borderless);
     ShowHelpMarker("Remove window decorations (title bar and borders) while in windowed mode");
     if (!is_windowed) ImGui::EndDisabled();
-    if (kmsdrm) ImGui::EndDisabled();
+    if (fullscreen_only) ImGui::EndDisabled();
 
     ImGui::Spacing();
 
@@ -119,8 +147,8 @@ void render_panel_display() {
     const char *screenmode_items[] = {"Windowed", "Full-window"};
     const int screenmode_values[] = {GFX_WINDOW, GFX_FULLWINDOW};
     ImGui::SetNextItemWidth(BUTTON_WIDTH * 1.5f);
-    if (kmsdrm) ImGui::BeginDisabled();
-    const char *native_mode_label = kmsdrm || changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen == GFX_FULLWINDOW
+    if (fullscreen_only) ImGui::BeginDisabled();
+    const char *native_mode_label = fullscreen_only || changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen == GFX_FULLWINDOW
         ? "Full-window" : "Windowed";
     if (ImGui::BeginCombo("##NativeMode", native_mode_label)) {
         for (int n = 0; n < IM_ARRAYSIZE(screenmode_items); n++) {
@@ -129,6 +157,7 @@ void render_panel_display() {
                 ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyle().Colors[ImGuiCol_HeaderActive]);
             if (ImGui::Selectable(screenmode_items[n], is_selected)) {
                 changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen = screenmode_values[n];
+                play_sync_screen_mode_cache(screenmode_values[n]);
             }
             if (is_selected) {
                 ImGui::PopStyleColor();
@@ -137,10 +166,12 @@ void render_panel_display() {
         }
         ImGui::EndCombo();
     }
-    if (kmsdrm) ImGui::EndDisabled();
+    if (fullscreen_only) ImGui::EndDisabled();
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker(kmsdrm
-        ? "KMSDRM always uses the active console display in Full-window mode"
+    ShowHelpMarker(fullscreen_only
+        ? (kmsdrm
+            ? "KMSDRM always uses the active console display in Full-window mode"
+            : "Android always uses the device display in Full-window mode")
         : "Native chipset screen mode: Windowed or Full-window (borderless desktop mode)");
 
     ImGui::SameLine();
@@ -209,8 +240,8 @@ void render_panel_display() {
     ImGui::Text("RTG:");
     ImGui::SameLine(BUTTON_WIDTH);
     ImGui::SetNextItemWidth(BUTTON_WIDTH * 1.5f);
-    if (kmsdrm) ImGui::BeginDisabled();
-    const char *rtg_mode_label = kmsdrm || changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen == GFX_FULLWINDOW
+    if (fullscreen_only) ImGui::BeginDisabled();
+    const char *rtg_mode_label = fullscreen_only || changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen == GFX_FULLWINDOW
         ? "Full-window" : "Windowed";
     if (ImGui::BeginCombo("##RTGMode", rtg_mode_label)) {
         for (int n = 0; n < IM_ARRAYSIZE(screenmode_items); n++) {
@@ -227,10 +258,12 @@ void render_panel_display() {
         }
         ImGui::EndCombo();
     }
-    if (kmsdrm) ImGui::EndDisabled();
+    if (fullscreen_only) ImGui::EndDisabled();
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker(kmsdrm
-        ? "KMSDRM always uses the active console display in Full-window mode"
+    ShowHelpMarker(fullscreen_only
+        ? (kmsdrm
+            ? "KMSDRM always uses the active console display in Full-window mode"
+            : "Android always uses the device display in Full-window mode")
         : "RTG (Picasso96) screen mode when using graphics card emulation");
 
     ImGui::SameLine();
@@ -335,7 +368,11 @@ void render_panel_display() {
             ImGui::EndCombo();
         }
         AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-        ShowHelpMarker("Emulated Amiga horizontal resolution: LowRes (320px), HighRes (640px), or SuperHighRes (1280px). This does not change the host display mode. Disabled when resolution autoswitch is enabled");
+        ShowHelpMarker("Sets the internal rendering pipeline's pixel mapping relative to the Amiga's video output.\n"
+            "LoRes \xE2\x80\x94 every rendered pixel equals 1 Amiga lores pixel (fastest; hires content is rendered at half resolution).\n"
+            "HiRes \xE2\x80\x94 lores pixels are rendered as 2 hires pixels, hires pixels map 1:1 (full quality; recommended).\n"
+            "SuperHiRes \xE2\x80\x94 rarely needed; used mainly for doubled-scanned AGA modes.\n"
+            "This does not change the host display mode. Disabled when resolution autoswitch is enabled.");
         if (!resolution_enabled) ImGui::EndDisabled();
 
         ImGui::TableNextColumn();
@@ -406,10 +443,11 @@ void render_panel_display() {
         ImGui::EndCombo();
     }
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker("Automatically adjust Amiberry's internal render resolution and line mode to match the Amiga screen. "
-        "This does not change the host display resolution or refresh rate. Always On follows the highest resolution "
-        "present in each frame. Percentage values require the dominant resolution to cover at least that share of "
-        "the frame; lower percentages switch more readily.");
+    ShowHelpMarker("Automatically match the internal render resolution to the Amiga's current screen mode each frame.\n"
+                "Always On \xE2\x80\x94 immediately follow whichever resolution appears in the frame.\n"
+                "Percentage thresholds (10%/33%/66%) \xE2\x80\x94 only switch when the dominant resolution covers at least that share of the frame; lower values switch more readily.\n"
+                "Caveats: mode switches take 1 frame (brief visual glitch), AGA can have \xE2\x80\x9Chires\xE2\x80\x9D pixels even in lores mode,\n"
+                "screenshots capture whichever resolution was active, and shader effects may behave differently between resolutions.");
 
     ImGui::Spacing();
 
@@ -574,9 +612,9 @@ void render_panel_display() {
     // Right Column
     // ---------------------------------------------------------
     if (ImGui::BeginTable("BottomGrid", 3, ImGuiTableFlags_None)) {
-        ImGui::TableSetupColumn("column1", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("column2", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("column3", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("column1", ImGuiTableColumnFlags_WidthStretch, 1.12f);
+        ImGui::TableSetupColumn("column2", ImGuiTableColumnFlags_WidthStretch, 0.88f);
+        ImGui::TableSetupColumn("column3", ImGuiTableColumnFlags_WidthStretch, 1.06f);
 
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
@@ -594,74 +632,121 @@ void render_panel_display() {
         ImGui::Spacing();
         EndGroupBox("Centering");
 
-        BeginGroupBox("Aspect ratio");
+        BeginGroupBox("Aspect and scaling");
+        // Stretch fills the window by definition, so aspect correction cannot apply.
+        const bool stretch_selected = changed_prefs.scaling_method == 3;
+        if (stretch_selected) ImGui::BeginDisabled();
         bool correct_aspect = changed_prefs.gfx_correct_aspect != 0;
         if (AmigaCheckbox("Correct aspect ratio", &correct_aspect)) {
             changed_prefs.gfx_correct_aspect = correct_aspect ? 1 : 0;
         }
-        ShowHelpMarker("Apply Amiga display aspect correction to native display modes.");
-        AmigaCheckbox("Auto integer scaling", &changed_prefs.gfx_keep_aspect);
-        ShowHelpMarker("Automatically select integer scaling factor based on resolution, line mode and doublescan settings to maintain correct aspect ratio");
+        if (stretch_selected) ImGui::EndDisabled();
+        ShowHelpMarker(stretch_selected
+            ? "Not available with the Stretch scaling method, which always fills the window."
+            : "Apply Amiga display aspect correction to native display modes.");
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("Scaling method:");
+        ImGui::SameLine();
+        const int scaling_idx = scaling_method_to_index(changed_prefs.scaling_method);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (ImGui::BeginCombo("##ScalingMethod", scaling_method_options[scaling_idx].label)) {
+            for (int n = 0; n < scaling_method_option_count; n++) {
+                const bool is_selected = scaling_idx == n;
+                if (is_selected)
+                    ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyle().Colors[ImGuiCol_HeaderActive]);
+                if (ImGui::Selectable(scaling_method_options[n].label, is_selected)) {
+                    changed_prefs.scaling_method = scaling_method_options[n].value;
+                }
+                if (is_selected) {
+                    ImGui::PopStyleColor();
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
+        ShowHelpMarker("How the display is scaled to fit the window.\nAuto: uses pixel-perfect integer scaling when it fills the same area as best fit, otherwise smooth scaling.\nNearest: sharp pixels, Linear: smooth, Integer: always pixel-perfect.\nStretch: fills the whole window, ignoring the aspect ratio.");
         ImGui::Spacing();
-        EndGroupBox("Aspect ratio");
+        EndGroupBox("Aspect and scaling");
 
         ImGui::TableNextColumn();
 
         // Line Mode Group
+        constexpr float line_mode_group_indent = 16.0f;
+        ImGui::Indent(line_mode_group_indent);
         BeginGroupBox("Line Mode");
         if (!linemode_enabled) ImGui::BeginDisabled();
-        if (AmigaRadioButton("Single", changed_prefs.gfx_vresolution == 0 && changed_prefs.gfx_pscanlines == 0)) {
-            changed_prefs.gfx_vresolution = 0;
+        // Keep the underlying preference tuple canonical so one radio group can
+        // never describe two modes, including after loading older configurations.
+        if (changed_prefs.gfx_vresolution == 0) {
             changed_prefs.gfx_pscanlines = 0;
             changed_prefs.gfx_iscanlines = 0;
+        } else {
+            changed_prefs.gfx_vresolution = 1;
+            if (changed_prefs.gfx_pscanlines < 0 || changed_prefs.gfx_pscanlines > 3)
+                changed_prefs.gfx_pscanlines = 0;
+            if (changed_prefs.gfx_iscanlines < 0 || changed_prefs.gfx_iscanlines > 2)
+                changed_prefs.gfx_iscanlines = 0;
         }
+        int selected_line_mode = 0;
+        if (changed_prefs.gfx_vresolution != 0) {
+            selected_line_mode = changed_prefs.gfx_pscanlines >= 0
+                && changed_prefs.gfx_pscanlines <= 3
+                ? changed_prefs.gfx_pscanlines + 1 : 1;
+        }
+        int requested_line_mode = selected_line_mode;
+        if (AmigaRadioButton("Single", selected_line_mode == 0)) requested_line_mode = 0;
         ShowHelpMarker("Single scan: display one line per scanline (200 lines for NTSC, 256 for PAL)");
-        if (AmigaRadioButton("Double", changed_prefs.gfx_vresolution == 1 && changed_prefs.gfx_pscanlines == 0)) {
-            changed_prefs.gfx_vresolution = 1;
-            changed_prefs.gfx_pscanlines = 0;
-        }
+        if (AmigaRadioButton("Double", selected_line_mode == 1)) requested_line_mode = 1;
         ShowHelpMarker("Line doubling: display each line twice for better visibility (400/512 lines)");
-        if (AmigaRadioButton("Scanlines", changed_prefs.gfx_vresolution == 1 && changed_prefs.gfx_pscanlines == 1)) {
-            changed_prefs.gfx_vresolution = 1;
-            changed_prefs.gfx_pscanlines = 1;
-        }
+        if (AmigaRadioButton("Scanlines", selected_line_mode == 2)) requested_line_mode = 2;
         ShowHelpMarker("Simulate scanlines with black lines between display lines for CRT effect");
-        if (AmigaRadioButton("Double, fields", changed_prefs.gfx_vresolution == 1 && changed_prefs.gfx_pscanlines == 2)) {
-            changed_prefs.gfx_vresolution = 1;
-            changed_prefs.gfx_pscanlines = 2;
-        }
+        if (AmigaRadioButton("Double, fields", selected_line_mode == 3)) requested_line_mode = 3;
         ShowHelpMarker("Interlaced field rendering: alternates between even and odd lines");
-        if (AmigaRadioButton("Double, fields+", changed_prefs.gfx_vresolution == 1 && changed_prefs.gfx_pscanlines == 3)) {
-            changed_prefs.gfx_vresolution = 1;
-            changed_prefs.gfx_pscanlines = 3;
-        }
+        if (AmigaRadioButton("Double, fields+", selected_line_mode == 4)) requested_line_mode = 4;
         ShowHelpMarker("Enhanced interlaced field rendering with improved blending");
         if (!linemode_enabled) ImGui::EndDisabled();
+        if (requested_line_mode != selected_line_mode) {
+            changed_prefs.gfx_vresolution = requested_line_mode == 0
+                ? 0 : 1;
+            changed_prefs.gfx_pscanlines = requested_line_mode == 0
+                ? 0 : requested_line_mode - 1;
+            if (requested_line_mode == 0)
+                changed_prefs.gfx_iscanlines = 0;
+        }
         ImGui::Spacing();
         EndGroupBox("Line Mode");
+        ImGui::Unindent(line_mode_group_indent);
 
         ImGui::TableNextColumn();
 
         // Interlaced Line Mode Group
         BeginGroupBox("Interlaced line mode");
-        bool is_double = changed_prefs.gfx_vresolution > 0;
-        if (!linemode_enabled || is_double) ImGui::BeginDisabled();
-        if (AmigaRadioButton("Single##I", !is_double)) {
-            changed_prefs.gfx_iscanlines = 0;
+        const bool is_double = changed_prefs.gfx_vresolution != 0;
+        int selected_interlaced_mode = 0;
+        if (is_double) {
+            selected_interlaced_mode = changed_prefs.gfx_iscanlines >= 0
+                && changed_prefs.gfx_iscanlines <= 2
+                ? changed_prefs.gfx_iscanlines + 1 : 1;
         }
+        int requested_interlaced_mode = selected_interlaced_mode;
+        if (!linemode_enabled || is_double) ImGui::BeginDisabled();
+        if (AmigaRadioButton("Single##I", selected_interlaced_mode == 0)) requested_interlaced_mode = 0;
         ShowHelpMarker("Single line mode for interlaced screens (available only in single line mode)");
         if (!linemode_enabled || is_double) ImGui::EndDisabled();
 
         if (!linemode_enabled || !is_double) ImGui::BeginDisabled();
-        if (AmigaRadioButton("Double, frames##I", is_double && changed_prefs.gfx_iscanlines == 0)) {
-            changed_prefs.gfx_iscanlines = 0;
-        }
+        if (AmigaRadioButton("Double, frames##I", selected_interlaced_mode == 1)) requested_interlaced_mode = 1;
         ShowHelpMarker("Double frames mode for interlaced screens (available only in double line mode)");
-        AmigaRadioButton("Double, fields##I", &changed_prefs.gfx_iscanlines, 1);
+        if (AmigaRadioButton("Double, fields##I", selected_interlaced_mode == 2)) requested_interlaced_mode = 2;
         ShowHelpMarker("Interlaced field rendering: alternates between even and odd lines");
-        AmigaRadioButton("Double, fields+##I", &changed_prefs.gfx_iscanlines, 2);
+        if (AmigaRadioButton("Double, fields+##I", selected_interlaced_mode == 3)) requested_interlaced_mode = 3;
         ShowHelpMarker("Enhanced interlaced field rendering with improved blending");
         if (!linemode_enabled || !is_double) ImGui::EndDisabled();
+        if (requested_interlaced_mode != selected_interlaced_mode) {
+            changed_prefs.gfx_iscanlines = requested_interlaced_mode == 0
+                ? 0 : requested_interlaced_mode - 1;
+        }
         ImGui::Spacing();
         EndGroupBox("Interlaced line mode");
 

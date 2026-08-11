@@ -165,3 +165,5 @@ docs/superpowers
 .claude/settings.local.json
 .compound-engineering/*.local.yaml
 docs/plans
+.omo
+.hermes

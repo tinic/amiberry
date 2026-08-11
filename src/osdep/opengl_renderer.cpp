@@ -34,6 +34,7 @@
 #include "imgui_overlay.h"
 #include "imgui_osk.h"
 #include "on_screen_joystick.h"
+#include "on_screen_joystick_layout.h"
 #include "gui/gui_handling.h"
 #include <algorithm>
 #include <cmath>
@@ -316,45 +317,51 @@ bool OpenGLRenderer::alloc_texture(int monid, int w, int h)
 	return m_shader.crtemu != nullptr || m_shader.external != nullptr || m_shader.preset != nullptr;
 }
 
-// Helper to decide between Linear (smooth) and Nearest Neighbor (pixelated) scaling
-static bool ar_is_exact(const SDL_DisplayMode* mode, const int width, const int height)
-{
-	return mode->w % width == 0 && mode->h % height == 0;
-}
-
-void OpenGLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
+void OpenGLRenderer::set_scaling(const int monid, const uae_prefs* p, int /*w*/, int /*h*/)
 {
 	if (currprefs.headless) return;
+	amiberry_gui_geometry_invalidate(monid);
 
-	auto scale_quality = "nearest";
+	GLenum texture_filter = GL_NEAREST;
 	m_integer_scaling = false;
+	m_stretch_to_fill = false;
 
 	switch (p->scaling_method) {
 	case -1: // Auto
-		if (!ar_is_exact(&sdl_mode, w, h))
-			scale_quality = "linear";
+		texture_filter = GL_LINEAR;
 		break;
-	case 0: scale_quality = "nearest"; break;
-	case 1: scale_quality = "linear"; break;
-	case 2: scale_quality = "nearest"; m_integer_scaling = true; break;
-	default: scale_quality = "linear"; break;
+	case 0: texture_filter = GL_NEAREST; break;
+	case 1: texture_filter = GL_LINEAR; break;
+	case 2: texture_filter = GL_NEAREST; m_integer_scaling = true; break;
+	case 3: texture_filter = GL_LINEAR; m_stretch_to_fill = true; break;
+	default: texture_filter = GL_LINEAR; break;
 	}
+	update_texture_filter(texture_filter);
+}
 
-	m_shader.texture_filter_mode = (strcmp(scale_quality, "linear") == 0) ? GL_LINEAR : GL_NEAREST;
+void OpenGLRenderer::update_texture_filter(const GLenum texture_filter)
+{
+	const bool no_shader_active = m_shader.crtemu != nullptr
+		&& m_shader.crtemu->type == CRTEMU_TYPE_NONE
+		&& m_shader.external == nullptr
+		&& m_shader.preset == nullptr;
+	if (m_shader.texture_filter_mode == texture_filter
+		&& (!no_shader_active
+			|| m_shader.crtemu->texture_filter == static_cast<CRTEMU_GLint>(texture_filter)))
+		return;
+	m_shader.texture_filter_mode = texture_filter;
 
 	// Only apply filter mode when no shader is active (NONE mode without external shader).
 	// When a shader is active, it controls its own texture sampling.
-	bool no_shader_active = (m_shader.crtemu != nullptr
-		&& m_shader.crtemu->type == CRTEMU_TYPE_NONE
-		&& m_shader.external == nullptr
-		&& m_shader.preset == nullptr);
 	if (no_shader_active) {
 		if (m_shader.crtemu->backbuffer != 0 && glIsTexture(m_shader.crtemu->backbuffer)) {
-			m_shader.crtemu->texture_filter = m_shader.texture_filter_mode;
+			m_shader.crtemu->texture_filter = texture_filter;
 			glBindTexture(GL_TEXTURE_2D, m_shader.crtemu->backbuffer);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_shader.texture_filter_mode);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_shader.texture_filter_mode);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, texture_filter);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, texture_filter);
 			glBindTexture(GL_TEXTURE_2D, 0);
+		} else {
+			m_shader.crtemu->texture_filter = texture_filter;
 		}
 	}
 }
@@ -574,7 +581,7 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 	// in crop_aspect, accounting for resolution mode and NTSC correction.
 	// Use it instead of the fixed 4:3 that only applies to the full uncropped frame.
 	float desired_aspect;
-	if ((currprefs.gfx_auto_crop || currprefs.gfx_manual_crop) && !mon->screen_is_picasso && crop_aspect > 0.0f) {
+	if (!mon->screen_is_picasso && crop_aspect > 0.0f) {
 		desired_aspect = crop_aspect;
 	} else {
 		desired_aspect = calculate_desired_aspect(mon);
@@ -632,12 +639,14 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 	// that all shader paths use instead of the full drawable.
 	int renderAreaX = 0, renderAreaY = 0;
 	int renderAreaW = drawableWidth, renderAreaH = drawableHeight;
+	bool has_bounded_bezel_area = false;
 
 	if (filter_prefs.use_custom_bezel && m_overlay.bezel_texture != 0 && m_overlay.bezel_hole_w > 0.0f && m_overlay.bezel_hole_h > 0.0f) {
 		renderAreaX = bezelDisplayX + static_cast<int>(m_overlay.bezel_hole_x * bezelDisplayW);
 		renderAreaY = bezelDisplayY + static_cast<int>(m_overlay.bezel_hole_y * bezelDisplayH);
 		renderAreaW = static_cast<int>(m_overlay.bezel_hole_w * bezelDisplayW);
 		renderAreaH = static_cast<int>(m_overlay.bezel_hole_h * bezelDisplayH);
+		has_bounded_bezel_area = true;
 	}
 
 	// Compute source dimensions early (needed for integer scaling)
@@ -659,115 +668,121 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 
 	const int src_w = (is_cropped) ? crop_w : (surface ? surface->w : 0);
 	const int src_h = (is_cropped) ? crop_h : (surface ? surface->h : 0);
+	const bool native_auto_crop = !mon->screen_is_picasso && currprefs.gfx_auto_crop;
+	int display_w = src_w;
+	int display_h = src_w > 0
+		? std::max(1, static_cast<int>(static_cast<float>(src_w) / desired_aspect + 0.5f)) : 0;
+	if (native_auto_crop && crop_display_w > 0 && crop_display_h > 0) {
+		display_w = crop_display_w;
+		display_h = crop_display_h;
+	}
+	const int integer_source_w = native_auto_crop ? display_w : src_w;
 
 	bool use_integer_scaling = mon->screen_is_picasso
 		? (mon->scalepicasso == RTG_MODE_INTEGER_SCALE)
 		: m_integer_scaling;
+	const bool auto_native_scaling = !mon->screen_is_picasso
+		&& currprefs.scaling_method == -1;
 
 	bool use_center = mon->screen_is_picasso
 		&& mon->scalepicasso == RTG_MODE_CENTER;
 
-	int destW, destH, destX, destY;
+	// Stretch applies to native modes only; RTG has its own scaling modes.
+	const bool stretch_to_fill = !mon->screen_is_picasso && m_stretch_to_fill;
 
-	if (renderAreaX != 0 || renderAreaY != 0 ||
-		renderAreaW != drawableWidth || renderAreaH != drawableHeight) {
-		destW = renderAreaW;
-		destH = renderAreaH;
-		destX = renderAreaX;
-		destY = renderAreaY;
-	} else if (use_center && src_w > 0 && src_h > 0) {
+	int destW, destH;
+
+	if (use_center && src_w > 0 && src_h > 0) {
 		destW = src_w;
 		destH = src_h;
-		destX = (renderAreaW - destW) / 2;
-		destY = (renderAreaH - destH) / 2;
-	} else {
+	} else if (stretch_to_fill) {
 		destW = renderAreaW;
-		destH = static_cast<int>(renderAreaW / desired_aspect);
+		destH = renderAreaH;
+	} else {
+		amiberry_gfx_aspect_fit_dimensions(
+			renderAreaW, renderAreaH, desired_aspect, destW, destH);
 
-		if (destH > renderAreaH) {
-			destH = renderAreaH;
-			destW = static_cast<int>(renderAreaH * desired_aspect);
-		}
-
-		if (destW <= 0) destW = 1;
-		if (destH <= 0) destH = 1;
-
-		if (use_integer_scaling && src_w > 0 && src_h > 0) {
-			// Use the aspect-corrected dimensions from auto_crop_image()
-			// (stored in crop_display_w/h to avoid the render_quad overwrite issue).
-			int display_w, display_h;
-			if (is_cropped && crop_display_w > 0 && crop_display_h > 0) {
-				display_w = crop_display_w;
-				display_h = crop_display_h;
-			} else {
-				display_w = src_w;
-				display_h = std::max(1, static_cast<int>(static_cast<float>(src_w) / desired_aspect + 0.5f));
-			}
-
+		if (auto_native_scaling && src_w > 0 && src_h > 0) {
+			use_integer_scaling = amiberry_gfx_auto_integer_dimensions(
+				renderAreaW, renderAreaH, integer_source_w, display_w, display_h,
+				currprefs.gfx_correct_aspect != 0, desired_aspect,
+				integer_target_aspect, destW, destH);
+		} else if (use_integer_scaling && src_w > 0 && src_h > 0) {
 			if (mon->screen_is_picasso) {
 				const float scale = calculate_rtg_integer_scale(renderAreaW, renderAreaH,
 					display_w, display_h, filter_prefs.gf[GF_RTG].gfx_filter_integerscalelimit);
 				destW = std::max(1, static_cast<int>(static_cast<float>(display_w) * scale + 0.5f));
 				destH = std::max(1, static_cast<int>(static_cast<float>(display_h) * scale + 0.5f));
-			} else if (!currprefs.gfx_correct_aspect) {
-				// Integer scaling without aspect correction uses the normalized
-				// crop geometry, not the desktop-sized stretch target.
-				const int scale = amiberry_gfx_native_integer_scale(
-					renderAreaW, renderAreaH, display_w, display_h);
-				destW = display_w * scale;
-				destH = display_h * scale;
 			} else {
-				amiberry_gfx_correct_aspect_integer_dimensions(
-					renderAreaW, renderAreaH, src_w, display_h,
-					integer_target_aspect, destW, destH);
+				amiberry_gfx_native_integer_dimensions(
+					renderAreaW, renderAreaH, integer_source_w, display_w, display_h,
+					currprefs.gfx_correct_aspect != 0, integer_target_aspect,
+					destW, destH);
 			}
 		}
 
-		destX = (renderAreaW - destW) / 2;
-		destY = (renderAreaH - destH) / 2;
+	}
+	if (auto_native_scaling) {
+		update_texture_filter(use_integer_scaling ? GL_NEAREST : GL_LINEAR);
 	}
 
-	// Flip Y for GL viewport: OpenGL has y=0 at bottom, bezel hole Y is y=0 at top
-	int glDestY = drawableHeight - destY - destH;
-	int glAreaY = drawableHeight - renderAreaY - renderAreaH;
+	const AmiberryGfxRect available_area{
+		renderAreaX, renderAreaY, renderAreaW, renderAreaH
+	};
+	const float bounded_fallback_aspect = use_integer_scaling
+		&& !mon->screen_is_picasso && currprefs.gfx_correct_aspect
+		? integer_target_aspect : desired_aspect;
+	const AmiberryGfxRect final_rect = amiberry_gfx_final_presentation_rect(
+		available_area, destW, destH, bounded_fallback_aspect,
+		has_bounded_bezel_area && use_integer_scaling && !use_center);
 
-	// Only clear if letterboxing is active (frame doesn't cover entire window)
-	if (destW < drawableWidth || destH < drawableHeight) {
+	// Flip Y for GL viewport: OpenGL has y=0 at bottom, bezel hole Y is y=0 at top
+	const int glDestY = drawableHeight - final_rect.y - final_rect.h;
+
+	// Clear whenever the presentation leaves any part of the drawable uncovered.
+	const AmiberryGfxRect drawable_area{0, 0, drawableWidth, drawableHeight};
+	if (!amiberry_gfx_rect_covers_area(final_rect, drawable_area)) {
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 	}
 
-	glViewport(destX, glDestY, destW, destH);
+	glViewport(final_rect.x, glDestY, final_rect.w, final_rect.h);
 
 	// Update render_quad to reflect the actual drawn area
-	render_quad.x = destX;
-	render_quad.y = destY;
-	render_quad.w = destW;
-	render_quad.h = destH;
+	render_quad.x = final_rect.x;
+	render_quad.y = final_rect.y;
+	render_quad.w = final_rect.w;
+	render_quad.h = final_rect.h;
+	const AmiberryGfxRect source_rect{
+		is_cropped ? crop_x : 0, is_cropped ? crop_y : 0, src_w, src_h
+	};
+	amiberry_gui_geometry_publish(monid, source_rect, final_rect,
+		AmiberryGuiViewportSpace::DrawablePixels,
+		drawableWidth, drawableHeight, "opengl");
 
 	// Some CRT shaders require an output at least as large as their input. Render
 	// them at that safe size, then resolve back to the aspect-correct destination
 	// instead of letting the oversized viewport be clipped by the framebuffer.
-	int shader_viewport_w = destW;
-	int shader_viewport_h = destH;
+	int shader_viewport_w = final_rect.w;
+	int shader_viewport_h = final_rect.h;
 	amiberry_gfx_shader_render_dimensions(
-		destW, destH, src_w, src_h, shader_viewport_w, shader_viewport_h);
+		final_rect.w, final_rect.h, src_w, src_h, shader_viewport_w, shader_viewport_h);
 	const bool custom_shader_active = (m_shader.preset && m_shader.preset->is_valid())
 		|| (m_shader.external && m_shader.external->is_valid());
 	bool use_shader_resolve = custom_shader_active
-		&& (shader_viewport_w != destW || shader_viewport_h != destH);
+		&& (shader_viewport_w != final_rect.w || shader_viewport_h != final_rect.h);
 	if (use_shader_resolve
 		&& !ensure_shader_resolve_target(shader_viewport_w, shader_viewport_h)) {
 		// Preserve final presentation geometry if the intermediate target cannot
 		// be allocated, even though shaders that require >= 1x may degrade.
-		shader_viewport_w = destW;
-		shader_viewport_h = destH;
+		shader_viewport_w = final_rect.w;
+		shader_viewport_h = final_rect.h;
 		use_shader_resolve = false;
 	}
 	const int shader_viewport_x = use_shader_resolve
-		? 0 : renderAreaX + (renderAreaW - shader_viewport_w) / 2;
+		? 0 : final_rect.x;
 	const int shader_viewport_y = use_shader_resolve
-		? 0 : glAreaY + (renderAreaH - shader_viewport_h) / 2;
+		? 0 : glDestY;
 	const GLuint shader_framebuffer = use_shader_resolve
 		? m_shader.resolve_framebuffer : 0;
 	if (use_shader_resolve) {
@@ -832,13 +847,10 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 		glDisableVertexAttribArray(1);
 		glDisableVertexAttribArray(2);
 
-		// When a custom bezel defines the viewport, skip crtemu's internal 4:3 letterboxing
-		m_shader.crtemu->skip_aspect_correction = (renderAreaW != drawableWidth || renderAreaH != drawableHeight);
+		// Presentation geometry is already final. CRTEMU may change pixels, but it
+		// must fill this viewport without applying another aspect correction.
+		m_shader.crtemu->skip_aspect_correction = true;
 		m_shader.crtemu->desired_aspect = desired_aspect;
-
-		if (m_shader.crtemu->type != CRTEMU_TYPE_NONE) {
-			glViewport(renderAreaX, glAreaY, renderAreaW, renderAreaH);
-		}
 
 		if (is_cropped && surface) {
 			uae_u8* crop_ptr = static_cast<uae_u8*>(surface->pixels) + (crop_y * surface->pitch) + (crop_x * m_gl_format.bpp);
@@ -852,13 +864,33 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 	}
 
 	if (use_shader_resolve) {
-		render_shader_resolve(destX, glDestY, destW, destH);
+		render_shader_resolve(final_rect.x, glDestY, final_rect.w, final_rect.h);
 	}
 
-	render_software_cursor(monid, destX, glDestY, destW, destH);
+	render_software_cursor(monid, final_rect.x, glDestY, final_rect.w, final_rect.h);
 	int glBezelY = drawableHeight - bezelDisplayY - bezelDisplayH;
 	render_bezel(bezelDisplayX, glBezelY, bezelDisplayW, bezelDisplayH);
-	render_osd(monid, destX, glDestY, destW, destH);
+	{
+		// WinUAE parity: the status line is an unscaled overlay positioned in
+		// output pixels, not part of the scaled Amiga image.
+		int osd_x = final_rect.x;
+		int osd_y = glDestY;
+		int osd_w = final_rect.w;
+		int osd_h = final_rect.h;
+		if (mon->statusline_surface) {
+			int slx = 0, sly = 0;
+			statusline_getpos(monid, &slx, &sly, drawableWidth, drawableHeight);
+			osd_w = mon->statusline_surface->w;
+			osd_h = mon->statusline_surface->h;
+			osd_x = slx;
+			// statusline_getpos positions the LED bar (TD_TOTAL_HEIGHT * mult),
+			// but the surface also carries a message area above it. Anchor the
+			// LED bar at the returned position and let the message extend up.
+			const int led_h = TD_TOTAL_HEIGHT * (statusline_get_multiplier(monid) / 100);
+			osd_y = drawableHeight - sly - led_h;
+		}
+		render_osd(monid, osd_x, osd_y, osd_w, osd_h);
+	}
 
 	render_vkbd(monid);
 	render_onscreen_joystick(monid);
@@ -1830,8 +1862,22 @@ void OpenGLRenderer::render_onscreen_joystick(int monid)
 	if (on_screen_joystick_is_enabled() && !imgui_osk_should_render())
 	{
 		int dw, dh;
-		get_drawable_size(AMonitors[monid].amiga_window, &dw, &dh);
-		on_screen_joystick_redraw_gl(dw, dh, render_quad);
+		SDL_Window* window = AMonitors[monid].amiga_window;
+		get_drawable_size(window, &dw, &dh);
+		SDL_Rect drawable_safe{0, 0, dw, dh};
+#ifdef __ANDROID__
+		int window_w = 0;
+		int window_h = 0;
+		SDL_Rect window_safe{};
+		SDL_GetWindowSize(window, &window_w, &window_h);
+		if (window_w > 0 && window_h > 0 && SDL_GetWindowSafeArea(window, &window_safe)) {
+			const auto scaled_safe = osj_layout::scale_rect_between_spaces(
+				{window_safe.x, window_safe.y, window_safe.w, window_safe.h},
+				{0, 0, window_w, window_h}, {0, 0, dw, dh});
+			drawable_safe = {scaled_safe.x, scaled_safe.y, scaled_safe.w, scaled_safe.h};
+		}
+#endif
+		on_screen_joystick_redraw_gl(dw, dh, drawable_safe, render_quad);
 	}
 }
 

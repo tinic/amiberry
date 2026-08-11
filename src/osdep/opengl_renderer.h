@@ -158,6 +158,7 @@ private:
 	ShaderState m_shader;
 	GLOverlayState m_overlay;
 	bool m_integer_scaling = false; // Integer scaling for native Amiga modes (scaling_method == 2)
+	bool m_stretch_to_fill = false; // Fill the render area, ignoring aspect (scaling_method == 3)
 
 	// Cached GL pixel format info (resolved once from pixel_format, reused per frame)
 	struct GLFormatInfo {
@@ -175,6 +176,7 @@ private:
 	bool ensure_shader_resolve_target(int width, int height);
 	void destroy_shader_resolve_target();
 	void render_shader_resolve(int x, int y, int width, int height);
+	void update_texture_filter(GLenum texture_filter);
 
 	// Private helper for external shader rendering
 	void render_external_shader(ExternalShader* shader, int monid,

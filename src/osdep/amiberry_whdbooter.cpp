@@ -342,6 +342,7 @@ void symlink_roms(struct uae_prefs* prefs)
 	// These are all the kickstart rom files found in skick346.lha
 	//   http://aminet.net/package/util/boot/skick346
 
+	make_rom_symlink("kick31034.A1000", 2, prefs);
 	make_rom_symlink("kick33180.A500", 5, prefs);
 	make_rom_symlink("kick34005.A500", 6, prefs);
 	make_rom_symlink("kick37175.A500", 7, prefs);
@@ -842,7 +843,7 @@ void set_compatibility_settings(uae_prefs* prefs, const game_hardware_options& g
 	}
 
 	// Screen settings, only if allowed to override the defaults from amiberry.conf
-	if (amiberry_options.allow_display_settings_from_xml)
+	if (amiberry_options.allow_display_settings_from_json)
 	{
 		set_gfx_settings(prefs, game_detail);
 	}

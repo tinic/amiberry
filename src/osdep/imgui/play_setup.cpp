@@ -17,45 +17,18 @@ static int screen_mode_to_fullscreen(const PlayScreenMode mode)
 	return GFX_WINDOW;
 }
 
-static int shader_choice_to_prefs(const PlayShaderChoice choice)
-{
-	switch (choice) {
-	case PlayShaderChoice::None:
-		return 0;
-	case PlayShaderChoice::Crt:
-		return 1;
-	case PlayShaderChoice::Monitor1084:
-		return 2;
-	case PlayShaderChoice::Custom:
-		return -1;
-	}
-
-	return 0;
-}
-
 void play_apply_display_defaults(const PlayDisplayDefaults& defaults, PlayDisplayPrefs& prefs)
 {
 	const auto fullscreen = screen_mode_to_fullscreen(defaults.screen_mode);
 	prefs.native_fullscreen = fullscreen;
 	prefs.rtg_fullscreen = fullscreen;
 
-	switch (defaults.scaling) {
-	case PlayScalingMode::Auto:
-		prefs.scaling_method = -1;
-		prefs.gfx_autoresolution = 0;
-		break;
-	case PlayScalingMode::Smooth:
-		prefs.scaling_method = 1;
-		prefs.gfx_autoresolution = 0;
-		break;
-	case PlayScalingMode::Integer:
-		prefs.scaling_method = 2;
-		prefs.gfx_autoresolution = 1;
-		break;
-	}
+	prefs.scaling_method = defaults.scaling_method;
+	// Integer scaling only lands on exact multiples when the resolution follows
+	// the mode, so this flow turns autoswitch on for it and leaves it off otherwise.
+	prefs.gfx_autoresolution = defaults.scaling_method == 2 ? 1 : 0;
 
-	prefs.shader_choice = shader_choice_to_prefs(defaults.shader);
-	prefs.preserve_shader = defaults.shader == PlayShaderChoice::Custom;
+	prefs.shader = defaults.shader.empty() ? "none" : defaults.shader;
 	prefs.gfx_auto_crop = defaults.auto_crop;
 }
 
