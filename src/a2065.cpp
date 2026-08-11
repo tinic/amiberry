@@ -323,6 +323,157 @@ static void log_packet(const uae_u8 *p, int size)
 	write_log("\n");
 }
 
+
+/* Per-frame receive tap: follows one frame from pcap to the receive ring so a
+   frame that never reaches the guest can be attributed to a stage.  Prints the
+   TCP sequence number, which is what a capture on the host NIC is keyed by.
+   Off unless AMIBERRY_A2065_TAP is set. */
+int a2065_tap_on(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("AMIBERRY_A2065_TAP");
+		on = (e && atoi(e)) ? 1 : 0;
+	}
+	return on;
+}
+
+void a2065_tap_log(const char *stage, const uae_u8 *d, int len)
+{
+	if (!a2065_tap_on() || !d || len < 54)
+		return;
+	if (d[12] != 0x08 || d[13] != 0x00)		/* IPv4 */
+		return;
+	const int ihl = (d[14] & 0x0f) * 4;
+	if (d[14 + 9] != 6 || ihl < 20)			/* TCP */
+		return;
+	const uae_u8 *t = d + 14 + ihl;
+	if (len < 14 + ihl + 20)
+		return;
+	const uae_u32 seq = ((uae_u32)t[4] << 24) | ((uae_u32)t[5] << 16) |
+			    ((uae_u32)t[6] << 8) | t[7];
+	const int sport = (t[0] << 8) | t[1];
+	const int dport = (t[2] << 8) | t[3];
+	const int doff = (t[12] >> 4) * 4;
+	const int totlen = (d[14 + 2] << 8) | d[14 + 3];
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	write_log(_T("A2065TAP %s %lu.%06lu %d>%d seq=%lu plen=%d\n"), stage,
+		  (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000),
+		  sport, dport, (unsigned long)seq,
+		  totlen - ihl - doff);
+}
+
+/* Transmit-direction tap: the frame the guest is putting on the wire, keyed by
+   the ACK number, which is what pairs it with the inbound data it covers. */
+static void a2065_tap_log_tx(const char *stage, const uae_u8 *d, int len)
+{
+	if (!a2065_tap_on() || !d || len < 54)
+		return;
+	if (d[12] != 0x08 || d[13] != 0x00)		/* IPv4 */
+		return;
+	const int ihl = (d[14] & 0x0f) * 4;
+	if (d[14 + 9] != 6 || ihl < 20)			/* TCP */
+		return;
+	const uae_u8 *t = d + 14 + ihl;
+	if (len < 14 + ihl + 20)
+		return;
+	const uae_u32 seq = ((uae_u32)t[4] << 24) | ((uae_u32)t[5] << 16) |
+			    ((uae_u32)t[6] << 8) | t[7];
+	const uae_u32 ack = ((uae_u32)t[8] << 24) | ((uae_u32)t[9] << 16) |
+			    ((uae_u32)t[10] << 8) | t[11];
+	const int sport = (t[0] << 8) | t[1];
+	const int dport = (t[2] << 8) | t[3];
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	write_log(_T("A2065TAP %s %lu.%06lu %d>%d ack=%lu seq=%lu\n"), stage,
+		  (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000),
+		  sport, dport, (unsigned long)ack, (unsigned long)seq);
+}
+
+/* Offload-partial transport checksums, repaired at the point a real wire
+   would have carried them filled in.
+
+   A sender (or a host bridge resegmenting a GRO'd train) that hands its NIC a
+   CHECKSUM_PARTIAL packet stores only the pseudo-header sum in the TCP/UDP
+   checksum field and leaves the rest to hardware.  libpcap taps the frame
+   before that hardware step, so on a virtualised path the emulated guest
+   receives byte streams no real NIC would ever put on a wire: valid data,
+   checksum field holding exactly the pseudo-header sum.  A verifying guest
+   stack then drops every such segment and the sender's RTO becomes the
+   transfer's clock.  Measured on a bridged Proxmox VM against a macOS sender:
+   149 of 299 first-transmission data segments arrived in that state, every
+   retransmission arrived filled in, reads ran at the retransmission timer.
+   QEMU's net layer performs the same fix-up for emulated NICs that do not do
+   offload; this is the pcap-backend equivalent.
+
+   Only a frame whose stored checksum equals the pseudo-header sum (or its
+   complement) is touched, so a genuinely corrupt frame still reaches the
+   guest exactly as it arrived.  AMIBERRY_A2065_CSUM_FIX=0 disables. */
+
+static uae_u32 a2065_csum_add(uae_u32 sum, const uae_u8 *p, int len)
+{
+	for (int i = 0; i + 1 < len; i += 2)
+		sum += (p[i] << 8) | p[i + 1];
+	if (len & 1)
+		sum += p[len - 1] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return sum;
+}
+
+static unsigned long a2065_csum_fixed;
+
+static void a2065_fix_partial_csum(uae_u8 *d, int len)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("AMIBERRY_A2065_CSUM_FIX");
+		on = (e && !atoi(e)) ? 0 : 1;
+	}
+	if (!on || len < 14 + 20)
+		return;
+	if (d[12] != 0x08 || d[13] != 0x00)		/* IPv4 only */
+		return;
+	uae_u8 *ip = d + 14;
+	const int ihl = (ip[0] & 0x0f) * 4;
+	const int totlen = (ip[2] << 8) | ip[3];
+	if ((ip[0] >> 4) != 4 || ihl < 20 || totlen < ihl || totlen > len - 14)
+		return;
+	if (((ip[6] & 0x3f) | ip[7]) != 0)		/* no fragments */
+		return;
+	const int proto = ip[9];
+	int csum_off;
+	if (proto == 6)
+		csum_off = 16;				/* TCP */
+	else if (proto == 17)
+		csum_off = 6;				/* UDP */
+	else
+		return;
+	uae_u8 *tr = ip + ihl;
+	const int trlen = totlen - ihl;
+	if (trlen < csum_off + 2)
+		return;
+	const uae_u32 stored = (tr[csum_off] << 8) | tr[csum_off + 1];
+	uae_u32 pseudo = a2065_csum_add(0, ip + 12, 8);	/* src, dst */
+	pseudo += proto + trlen;
+	while (pseudo >> 16)
+		pseudo = (pseudo & 0xffff) + (pseudo >> 16);
+	if (stored != pseudo && stored != ((~pseudo) & 0xffff))
+		return;
+	tr[csum_off] = 0;
+	tr[csum_off + 1] = 0;
+	uae_u32 sum = a2065_csum_add(pseudo, tr, trlen);
+	sum = (~sum) & 0xffff;
+	if (proto == 17 && sum == 0)
+		sum = 0xffff;
+	tr[csum_off] = sum >> 8;
+	tr[csum_off + 1] = sum & 0xff;
+	a2065_csum_fixed++;
+	if (a2065_tap_on() && (a2065_csum_fixed % 100) == 1)
+		write_log(_T("A2065TAP csumfix total=%lu\n"), a2065_csum_fixed);
+}
+
 static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 {
 	int i;
@@ -335,6 +486,9 @@ static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 	const uae_u8 *dstmac, *srcmac;
 	struct s2devstruct *dev = (struct s2devstruct*)devv;
 
+	uae_u8 tap_frame[64];
+	const int tap_len = len < 64 ? len : 64;
+	memcpy(tap_frame, databuf, tap_len);
 	dstmac = databuf;
 	srcmac = databuf + 6;
 
@@ -346,8 +500,10 @@ static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 		log_packet(databuf, len);
 	}
 
-	if (!(csr[0] & CSR0_RXON)) // receiver off?
+	if (!(csr[0] & CSR0_RXON)) { // receiver off?
+		a2065_tap_log("x-rxoff", databuf, len);
 		return;
+	}
 	if (len < 20) { // too short
 		if (log_a2065)
 			write_log (_T("7990: short frame, %d bytes\n"), len);
@@ -500,6 +656,19 @@ static void gotfunc2(void *devv, const uae_u8 *databuf, int len)
 			break;
 	}
 
+	if (a2065_tap_on()) {
+		/* Byte sum of the frame as handed to the ring copy, so a guest-side
+		   dump can prove or clear the emulator's receive path. */
+		unsigned long fs = 0;
+		for (i = 0; i < len; i++)
+			fs += tmp[i];
+		struct timespec fts;
+		clock_gettime(CLOCK_REALTIME, &fts);
+		write_log(_T("A2065TAP fsum %lu.%06lu len=%d sum=%08lx\n"),
+			  (unsigned long)fts.tv_sec,
+			  (unsigned long)(fts.tv_nsec / 1000), len, fs);
+	}
+	a2065_tap_log("r", tap_frame, tap_len);
 	csr[0] |= CSR0_RINT;
 	devices_rethink_all(rethink_a2065);
 }
@@ -585,6 +754,43 @@ static bool receive_space_available(int len)
 	return false;
 }
 
+/* Receive pacing.  A real A2065 takes frames off 10BASE-T, so the wire itself
+   is the flow control: one 1500-byte frame every 1.2 ms at most.  Nothing here
+   paced delivery, so a fast host hands the guest bursts it cannot recycle
+   receive descriptors for, and receive_queue_drain() below then drops them for
+   want of ring space -- invisibly, since that path does not set CSR0_MISS.
+   Credit accrues per scanline and is capped, so a short burst still passes as
+   it would on real wire.  Off unless AMIBERRY_A2065_KBIT is set. */
+static int rx_credit;
+static int rx_bytes_per_line = -1;
+
+static void a2065_rx_credit_tick(void)
+{
+	if (rx_bytes_per_line < 0) {
+		const char *s = getenv("AMIBERRY_A2065_KBIT");
+		const int kbit = s ? atoi(s) : 0;
+		/* Nominal PAL line rate.  A prototype knob, not a calibrated clock. */
+		rx_bytes_per_line = kbit > 0 ? (kbit * 1000 / 8) / 15625 : 0;
+		if (kbit > 0 && rx_bytes_per_line < 1)
+			rx_bytes_per_line = 1;
+	}
+	if (rx_bytes_per_line <= 0)
+		return;
+	rx_credit += rx_bytes_per_line;
+	if (rx_credit > MAX_PACKET_SIZE * 2)
+		rx_credit = MAX_PACKET_SIZE * 2;
+}
+
+static bool a2065_rx_credit_take(int len)
+{
+	if (rx_bytes_per_line <= 0)
+		return true;
+	if (rx_credit < len)
+		return false;
+	rx_credit -= len;
+	return true;
+}
+
 static void receive_queue_drain(void)
 {
 	uae_u8 packet[MAX_PACKET_SIZE];
@@ -594,13 +800,36 @@ static void receive_queue_drain(void)
 		if (len <= 0)
 			return;
 		if (!receive_packet_can_fit(len)) {
+			/* Wait, do not discard.  The guest has not recycled receive
+			   descriptors yet; it will.  This frame is already held in
+			   receive_buffer, which has RECEIVE_QUEUE_SIZE entries, so
+			   leaving it there costs nothing and the next hsync retries.
+			   Discarding it here is what turns a host-side burst into a
+			   lost segment and an RTO, on a path where the sender can put
+			   more in flight than the ring holds.  Set
+			   AMIBERRY_A2065_DROP_ON_FULL=1 for the old behaviour. */
+			static int drop_on_full = -1;
+			if (drop_on_full < 0) {
+				const char *e = getenv("AMIBERRY_A2065_DROP_ON_FULL");
+				drop_on_full = (e && atoi(e)) ? 1 : 0;
+			}
+			if (!drop_on_full)
+				return;
 			if (!receive_queue_pop(packet, &len))
 				return;
 			if (log_a2065)
 				write_log(_T("7990: dropping frame that does not fit receive ring, %d bytes\n"), len);
 			continue;
 		}
-		if (!receive_space_available(len))
+		if (!receive_space_available(len)) {
+			if (a2065_tap_on()) {
+				static unsigned long held;
+				if ((held++ % 5000) == 0)
+					write_log(_T("A2065TAP ringfull %lu\n"), (unsigned long)held);
+			}
+			return;
+		}
+		if (!a2065_rx_credit_take(len))
 			return;
 		if (!receive_queue_pop(packet, &len))
 			return;
@@ -621,11 +850,14 @@ static void gotfunc(void *devv, const uae_u8 *databuf, int len)
 	const int nextwrite = (receive_buffer_write + 1) & (RECEIVE_QUEUE_SIZE - 1);
 	if (nextwrite == receive_buffer_read) {
 		uae_sem_post(&receive_sem);
+		a2065_tap_log("X-qfull", databuf, len);
 		if (log_a2065)
 			write_log(_T("7990: receive queue full\n"));
 		return;
 	}
+	a2065_tap_log("g", databuf, len);
 	memcpy(receive_buffer + receive_buffer_write * MAX_PACKET_SIZE, databuf, len);
+	a2065_fix_partial_csum(receive_buffer + receive_buffer_write * MAX_PACKET_SIZE, len);
 	receive_buffer_size[receive_buffer_write] = len;
 	receive_buffer_write = nextwrite;
 	uae_sem_post(&receive_sem);
@@ -757,6 +989,7 @@ static void do_transmit (void)
 			}
 			log_packet(d, outsize);
 		}
+		a2065_tap_log_tx("t", d, outsize);
 		ethernet_trigger (td, sysdata);
 	}
 
@@ -799,6 +1032,7 @@ static void a2065_hsync_handler(void)
 	 * was left only draining its own buffer -- so received frames never arrived.
 	 * Without this, host->guest networking is dead (ping/telnet/ftp), while
 	 * guest->host TX still works. */
+	a2065_rx_credit_tick();
 	if (td != NULL)
 		ethernet_receive_poll(td, sysdata);
 	receive_queue_drain();
@@ -933,6 +1167,14 @@ static void chip_wput (uaecptr addr, uae_u16 v)
 			t = v & (CSR0_IDON | CSR0_TINT | CSR0_RINT | CSR0_MERR | CSR0_MISS | CSR0_CERR | CSR0_BABL);
 			csr[0] &= ~t;
 			csr[0] &= ~CSR0_ERR;
+
+			if ((v & CSR0_TDMD) && a2065_tap_on()) {
+				struct timespec tdts;
+				clock_gettime(CLOCK_REALTIME, &tdts);
+				write_log(_T("A2065TAP td %lu.%06lu\n"),
+					  (unsigned long)tdts.tv_sec,
+					  (unsigned long)(tdts.tv_nsec / 1000));
+			}
 
 			if ((csr[0] & CSR0_STOP) && !(oreg & CSR0_STOP)) {
 
@@ -1099,10 +1341,32 @@ static uae_u8 a2065_bget2 (uaecptr addr)
 	return v;
 }
 
+/* Guest CPU write returning a receive descriptor to the LANCE: the byte that
+   carries RMD1's OWN bit, inside the receive ring, with OWN going to 1.  Every
+   CPU store into board RAM funnels through a2065_bput2(), so word and long
+   writes land here too; LANCE-side DMA uses put_ram_word() and is not seen. */
+static void a2065_tap_rmd_own(uae_u32 idx, uae_u32 v)
+{
+	if (!a2065_tap_on() || !am_initialized || !am_rdr_rlen)
+		return;
+	if (!(v & 0x80))
+		return;
+	if (idx < am_rdr_rdra || idx >= am_rdr_rdra + am_rdr_rlen * 8)
+		return;
+	if (((idx - am_rdr_rdra) & 7) != 2)
+		return;
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	write_log(_T("A2065TAP v %lu.%06lu slot=%lu\n"),
+		  (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000),
+		  (unsigned long)((idx - am_rdr_rdra) / 8));
+}
+
 static void a2065_bput2 (uaecptr addr, uae_u32 v)
 {
 	if (addr >= RAM_OFFSET) {
 		boardram[(addr & RAM_MASK)] = v;
+		a2065_tap_rmd_own(addr & RAM_MASK, v);
 	}
 }
 

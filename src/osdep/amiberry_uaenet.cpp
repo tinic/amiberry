@@ -87,6 +87,7 @@ struct uaenet_data {
     int packetsinbuffer;
     bool prehandler;
     struct uaenet_queue *first, *last;
+    volatile int queue_dropped;
     bool closed;
     uae_sem_t change_sem;
     uae_sem_t sync_sem;
@@ -138,6 +139,8 @@ static uae_u16 compute_tcp_checksum(const uae_u8 *ip_hdr, int ip_hdr_len,
 }
 #endif
 
+extern void a2065_tap_log(const char *stage, const uae_u8 *d, int len);
+
 // Insert a single packet into the incoming queue (called from worker thread)
 static void uaenet_queue_one(struct uaenet_data *ud, const uae_u8 *data, int len)
 {
@@ -146,8 +149,22 @@ static void uaenet_queue_one(struct uaenet_data *ud, const uae_u8 *data, int len
     if (!ud || len <= 0 || len > MAX_FRAME_LEN)
         return;
 
+    a2065_tap_log("q", data, len);
+
     uae_sem_wait(&ud->queue_sem);
-    if (ud->packetsinbuffer > 50) {
+    /* The cap is a silent discard: nothing counts it and nothing logs it, so a
+       host burst deeper than this leaves as a lost segment and an RTO with no
+       trace anywhere.  uaenet_queue() above also splits a GRO-coalesced arrival
+       into individual frames, so one 64 KB super-packet becomes ~45 entries and
+       fills a 50-deep queue on its own.  AMIBERRY_A2065_QUEUE overrides it. */
+    static int qcap = -1;
+    if (qcap < 0) {
+        const char *e = getenv("AMIBERRY_A2065_QUEUE");
+        qcap = (e && atoi(e) > 0) ? atoi(e) : 50;
+    }
+    if (ud->packetsinbuffer > qcap) {
+        ud->queue_dropped++;
+        a2065_tap_log("Q-cap", data, len);
         uae_sem_post(&ud->queue_sem);
         return;
     }
@@ -366,6 +383,20 @@ static void uaenet_close_driver_internal(struct uaenet_data *ud)
     if (!ud)
         return;
 
+    /* Where frames actually went.  ps_drop is the kernel giving up because the
+       capture buffer was full; ps_ifdrop is the interface itself; queue_dropped
+       is our own cap above.  All three were silent before this. */
+#ifdef WITH_UAENET_PCAP
+    if (ud->handle) {
+        struct pcap_stat ps;
+        memset(&ps, 0, sizeof(ps));
+        if (pcap_stats(ud->handle, &ps) == 0)
+            write_log(_T("UAENET: pcap recv=%u kernel_drop=%u if_drop=%u\n"),
+                      ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+    }
+#endif
+    write_log(_T("UAENET: queue_dropped=%d\n"), ud->queue_dropped);
+
     uaenet_request_worker_stop(ud);
 
     if (ud->tid) {
@@ -549,7 +580,35 @@ int uaenet_open(void *vsd, struct netdriverdata *ndd, void *userdata, ethernet_g
         // own MAC — packets to the Amiga's MAC are silently discarded before
         // reaching the pcap socket. The BPF filter already limits capture to
         // relevant packets (to our MAC, broadcast, multicast).
-        ud->handle = pcap_open_live(ndd->name, 65536, 1, 10, ud->errbuf);
+        /* pcap_open_live() is pcap_create()+activate with a read timeout and
+           no immediate mode, so libpcap batches.  Measured: every inbound frame
+           spent a median 10.8 ms (max 17) between arriving on the host NIC and
+           reaching the guest receive ring, which is that 10 ms timer exactly.
+           The far end retransmit timer on a 4 ms path is about 63 ms, so the
+           batching costs a sixth of that budget before the guest has seen the
+           frame at all, on every frame.  Immediate mode hands each one over as
+           it arrives.  AMIBERRY_A2065_PCAP_IMMEDIATE=0 restores the batching. */
+        {
+            const char *imm_env = getenv("AMIBERRY_A2065_PCAP_IMMEDIATE");
+            const int want_immediate = (imm_env && !atoi(imm_env)) ? 0 : 1;
+            ud->handle = pcap_create(ndd->name, ud->errbuf);
+            if (ud->handle) {
+                pcap_set_snaplen(ud->handle, 65536);
+                pcap_set_promisc(ud->handle, 1);
+                pcap_set_timeout(ud->handle, 10);
+                if (want_immediate)
+                    pcap_set_immediate_mode(ud->handle, 1);
+                if (pcap_activate(ud->handle) < 0) {
+                    snprintf(ud->errbuf, PCAP_ERRBUF_SIZE, "%s",
+                             pcap_geterr(ud->handle));
+                    pcap_close(ud->handle);
+                    ud->handle = NULL;
+                } else {
+                    write_log(_T("UAENET: pcap immediate_mode=%d\n"),
+                              want_immediate);
+                }
+            }
+        }
         if (!ud->handle) {
             write_log(_T("UAENET: Failed to open device: %s\n"), ud->errbuf);
             uaenet_close_driver_internal(ud);
