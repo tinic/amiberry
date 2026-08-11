@@ -1164,18 +1164,71 @@ static volatile int receive_buffer_read, receive_buffer_write;
 static int receive_buffer_size[MAX_RECEIVE_BUFFER_INDEX];
 static uae_sem_t ne2000_sem;
 
+static struct {
+	int enabled;
+	uae_u32 got, rej, qfull, deliv, isrblock, rxfail, rxoff, rxdrop, irqon, irqoff, hsync;
+} ne2000_stats;
+
+static void ne2000_stats_dump(void)
+{
+	if (!ne2000_stats.enabled)
+		return;
+	ne2000_stats.hsync++;
+	if (ne2000_stats.hsync < 31280)
+		return;
+	ne2000_stats.hsync = 0;
+	write_log("NE2000STAT got=%u rej=%u qfull=%u deliv=%u isrblock=%u rxfail=%u rxoff=%u rxdrop=%u irqon=%u irqoff=%u\n",
+		ne2000_stats.got, ne2000_stats.rej, ne2000_stats.qfull, ne2000_stats.deliv,
+		ne2000_stats.isrblock, ne2000_stats.rxfail, ne2000_stats.rxoff, ne2000_stats.rxdrop,
+		ne2000_stats.irqon, ne2000_stats.irqoff);
+	write_log("NE2000REG cmd=%02x dcfg=%02x rxcr=%02x start=%04x stop=%04x bnry=%02x curr=%02x isr=%02x imr=%02x\n",
+		ne2000state.cmd, ne2000state.dcfg, ne2000state.rxcr, ne2000state.start, ne2000state.stop,
+		ne2000state.boundary, ne2000state.curpag, ne2000state.isr, ne2000state.imr);
+}
+
+/* Retrying a frame the ring will not take is back-pressure while the driver is
+ * draining. Before the driver programs PSTART/PSTOP the ring is zero bytes long
+ * and ne2000_buffer_full() is true for every frame, so the queue head never
+ * retires and one frame captured before bring-up stalls receive for the rest of
+ * the session. Drop what arrives with the chip stopped or unprogrammed, and
+ * bound the retries for a running one. */
+#define NE2000_RECEIVE_RETRIES 512
+static int receive_retry;
+
+static void ne2000_receive_consume(void)
+{
+	receive_retry = 0;
+	receive_buffer_read++;
+	receive_buffer_read &= (MAX_RECEIVE_BUFFER_INDEX - 1);
+}
+
 static void ne2000_receive_check2(void)
 {
-	if (receive_buffer_read != receive_buffer_write) {
-		if (ne2000state.isr & ENISR_RX)
+	NE2000State *s = &ne2000state;
+	while (receive_buffer_read != receive_buffer_write) {
+		if ((s->cmd & E8390_STOP) || s->stop <= s->start) {
+			ne2000_stats.rxoff++;
+			ne2000_receive_consume();
+			continue;
+		}
+		if (s->isr & ENISR_RX) {
+			ne2000_stats.isrblock++;
 			return;
-		if (ne2000_receive(&ncs, receive_buffer + receive_buffer_read * MAX_PACKET_SIZE, receive_buffer_size[receive_buffer_read]) < 0)
+		}
+		if (ne2000_receive(&ncs, receive_buffer + receive_buffer_read * MAX_PACKET_SIZE, receive_buffer_size[receive_buffer_read]) < 0) {
+			ne2000_stats.rxfail++;
+			if (++receive_retry < NE2000_RECEIVE_RETRIES)
+				return;
+			ne2000_stats.rxdrop++;
+			ne2000_receive_consume();
 			return;
+		}
+		ne2000_stats.deliv++;
 #ifdef DEBUG_NE2000
 		write_log("NE2000: %d byte receive accepted (%d %d)\n", receive_buffer_size[receive_buffer_read], receive_buffer_read, receive_buffer_write);
 #endif
-		receive_buffer_read++;
-		receive_buffer_read &= (MAX_RECEIVE_BUFFER_INDEX - 1);
+		ne2000_receive_consume();
+		return;
 	}
 }
 
@@ -1204,16 +1257,20 @@ static void gotfunc(void *devv, const uae_u8 *databuf, int len)
 	if (!receive_buffer)
 		return;
 	// immediately check if we don't need this packet. for better performance.
-	if (!ne2000_canreceive(&ncs, databuf))
+	if (!ne2000_canreceive(&ncs, databuf)) {
+		ne2000_stats.rej++;
 		return;
+	}
 	uae_sem_wait(&ne2000_sem);
 	int nextwrite = (receive_buffer_write + 1) & (MAX_RECEIVE_BUFFER_INDEX - 1);
 	if (nextwrite == receive_buffer_read) {
 		uae_sem_post(&ne2000_sem);
 		write_log("NE2000: receive buffer full\n");
+		ne2000_stats.qfull++;
 		return;
 	}
 	memcpy(receive_buffer + receive_buffer_write * MAX_PACKET_SIZE, databuf, len);
+	ethernet_fix_partial_csum(receive_buffer + receive_buffer_write * MAX_PACKET_SIZE, len);
 	receive_buffer_size[receive_buffer_write] = len;
 	receive_buffer_write++;
 	receive_buffer_write &= (MAX_RECEIVE_BUFFER_INDEX - 1);
@@ -1223,7 +1280,13 @@ static void gotfunc(void *devv, const uae_u8 *databuf, int len)
 
 static void ne2000_hsync_handler(struct pci_board_state *pcibs)
 {
+	/* Amiberry's uaenet queues captured frames on the pcap worker thread and
+	 * calls gotfunc only when the emulation thread asks for them. Nothing asked
+	 * on behalf of an NE2000 board, so the queue was never drained.
+	 * a2065_hsync_handler does the same. */
+	ethernet_receive_poll(td, sysdata);
 	ne2000_receive_check();
+	ne2000_stats_dump();
 }
 
 static void REGPARAM2 ne2000_bput(struct pci_board_state *pcibs, uaecptr addr, uae_u32 b)
@@ -1258,6 +1321,7 @@ static void ne2000_reset(struct pci_board_state *pcibs)
 {
 	ne2000_reset2(&ne2000state);
 	receive_buffer_read = receive_buffer_write = 0;
+	receive_retry = 0;
 }
 
 static void ne2000_free(struct pci_board_state *pcibs)
@@ -1304,6 +1368,8 @@ static bool ne2000_init_2(struct pci_board_state *pcibs, int romtype, const TCHA
 	ncs.ne2000state->irq_callback = pcibs->irq_callback;
 
 	uae_sem_init(&ne2000_sem, 0, 1);
+	memset(&ne2000_stats, 0, sizeof ne2000_stats);
+	ne2000_stats.enabled = getenv("AMIBERRY_NE2000_STATS") != NULL;
 	if (!receive_buffer) {
 		receive_buffer = xcalloc(uae_u8, MAX_PACKET_SIZE * MAX_RECEIVE_BUFFER_INDEX);
 	}
@@ -1972,6 +2038,12 @@ static void ariadne2_irq_callback(struct pci_board_state *pcibs, bool irq)
 #if ARIADNE2_LOG
 	write_log(_T("ariadne2_irq_callback %d\n"), irq);
 #endif
+	if (irq != ne->ariadne2_irq) {
+		if (irq)
+			ne2000_stats.irqon++;
+		else
+			ne2000_stats.irqoff++;
+	}
 	ne->ariadne2_irq = irq;
 	devices_rethink_all(rethink_ne2000);
 }
