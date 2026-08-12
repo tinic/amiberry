@@ -952,6 +952,8 @@ static void uaenet_gotdata (void *devv, const uae_u8 *d, int len)
 
 	type = (d[12] << 8) | d[13];
 	s2p = createreadpacket (dev, d, len);
+	/* on our own copy: the capture buffer d points into is const and shared */
+	ethernet_fix_partial_csum(s2p->data, len);
 	if (log_net)
 		write_log (_T("<-DST:%02X.%02X.%02X.%02X.%02X.%02X SRC:%02X.%02X.%02X.%02X.%02X.%02X E=%04X L=%d P=%p\n"),
 			d[0], d[1], d[2], d[3], d[4], d[5],
