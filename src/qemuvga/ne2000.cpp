@@ -1727,8 +1727,15 @@ static int toariadne2(struct ne2000_s *ne, uaecptr addr, uae_u32 *vp, int size, 
 		*bs = true;
 		return addr;
 	} else if (ne->ne2000_romtype == ROMTYPE_LANROVER) {
-		if ((addr & 0xc000) == 0x8000) {
-			int maddr = addr & 16383;
+		// The buffer window is the top half of the 64K board, 32K, and the
+		// whole of it: eb920.device programs PSTART=0x06 PSTOP=0x80, so the
+		// receive ring runs to chip address 0x7fff. Decoding 0xc000/16383
+		// exposed only the first 16K, and the ring crossing page 0x40 was the
+		// end of receive -- the driver read zeroes where the packet header
+		// was, stopped acknowledging ENISR_RX, and ne2000_receive_check2()
+		// then refused every later frame.
+		if ((addr & 0x8000) == 0x8000) {
+			int maddr = addr & 32767;
 			// memory
 			if (size == -4) {
 				uae_u16 vv = v >> 16;
