@@ -495,7 +495,18 @@ static void uaenet_fill_ifinfo(struct netdriverdata *n, const char *ifname)
     }
 
     memcpy(n->mac, n->originalmac, 6);
-    n->mac[0] ^= 0x02;
+    /* Locally administered, and a shape a SANA-II driver will take.  Only
+       bits 0 and 1 of the first octet are defined on Ethernet -- group and
+       locally administered -- but several Amiga drivers read bit 7 as the
+       group bit instead.  cnet.device is one: hand it a station address
+       with bit 7 set and S2_CONFIGINTERFACE answers S2ERR_BAD_ADDRESS with
+       S2WERR_SRC_ADDRESS, and the card never comes online at all.  A host
+       address of bc:24:11:93:e8:8b has that bit, and every ne2000 unit
+       inherited it here the moment this address stopped being zero.
+       Setting bit 1 and clearing bits 0 and 7 keeps the rest of the host's
+       address, so it stays as unique and as stable as it was, and it is a
+       unicast address on either reading of the first octet. */
+    n->mac[0] = (uae_u8)((n->mac[0] | 0x02) & 0x7e);
 }
 
 #ifdef WITH_UAENET_PCAP
