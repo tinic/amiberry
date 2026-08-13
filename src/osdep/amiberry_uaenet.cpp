@@ -422,6 +422,82 @@ static void uaenet_close_driver_internal(struct uaenet_data *ud)
 
 static struct netdriverdata nd[MAX_TOTAL_NET_DEVICES + 1];
 
+/* What the host says about the interface a unit is wired to.  netdriverdata
+   carries both to uaenet.device: td->mtu sizes every packet buffer and every
+   bounce buffer on both paths, and td->mac is the unit's station address, the
+   source of a cooked write and the filter a received frame has to match.
+   Neither had a value here, so a unit answered S2_DEVICEQUERY with MTU 0 and
+   S2_GETSTATIONADDRESS with 00:00:00:00:00:00: nothing could get a lease, and
+   the 16-byte buffers that came out of mtu + ETH_HEADER_SIZE + 2 took a full
+   frame each. */
+static long uaenet_sysfs_long(const char *ifname, const char *what)
+{
+    char  path[MAX_DPATH];
+    FILE *f;
+    long  val = -1;
+
+    snprintf(path, sizeof path, "/sys/class/net/%s/%s", ifname, what);
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    if (fscanf(f, "%ld", &val) != 1)
+        val = -1;
+    fclose(f);
+    return val;
+}
+
+static bool uaenet_sysfs_mac(const char *ifname, uae_u8 *out)
+{
+    char     path[MAX_DPATH];
+    FILE    *f;
+    unsigned b[6];
+    int      n;
+
+    snprintf(path, sizeof path, "/sys/class/net/%s/address", ifname);
+    f = fopen(path, "r");
+    if (!f)
+        return false;
+    n = fscanf(f, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]);
+    fclose(f);
+    if (n != 6)
+        return false;
+    for (int i = 0; i < 6; i++)
+        out[i] = (uae_u8)b[i];
+    return (out[0] | out[1] | out[2] | out[3] | out[4] | out[5]) != 0;
+}
+
+/* The guest is a second node on the same wire, so it cannot answer to the
+   host's own address.  Flipping the locally-administered bit gives it one that
+   differs from the host's by exactly that bit, is stable across runs, and
+   inherits its uniqueness from an address the host already owns.  A pseudo
+   device with no hardware address of its own gets one derived from its name
+   instead, which is as stable and as unique as the name is. */
+static void uaenet_fill_ifinfo(struct netdriverdata *n, const char *ifname)
+{
+    long mtu = uaenet_sysfs_long(ifname, "mtu");
+
+    /* Capped at what the backend itself carries: uaenet_getmtu() answers
+       MAX_MTU whatever the host link is, and the transmit path splits a
+       coalesced frame down to it, so a jumbo host MTU reported here would be
+       a size no unit could actually send. */
+    n->mtu = (mtu > 0 && mtu < MAX_MTU) ? (int)mtu : MAX_MTU;
+
+    if (!uaenet_sysfs_mac(ifname, n->originalmac)) {
+        uae_u32 h = 2166136261u;
+        for (const char *c = ifname; *c; c++)
+            h = (h ^ (uae_u8)*c) * 16777619u;
+        n->originalmac[0] = 0x00;
+        n->originalmac[1] = 0x80;
+        n->originalmac[2] = 0x10;
+        n->originalmac[3] = (uae_u8)(h >> 16);
+        n->originalmac[4] = (uae_u8)(h >> 8);
+        n->originalmac[5] = (uae_u8)h;
+    }
+
+    memcpy(n->mac, n->originalmac, 6);
+    n->mac[0] ^= 0x02;
+}
+
 #ifdef WITH_UAENET_PCAP
 // Enumerate network devices
 struct netdriverdata *uaenet_enumerate(const TCHAR *name)
@@ -452,6 +528,7 @@ struct netdriverdata *uaenet_enumerate(const TCHAR *name)
         nd[j].type = UAENET_PCAP;
         nd[j].active = 1;
         nd[j].driverdata = nullptr; // Initialize driverdata to nullptr
+        uaenet_fill_ifinfo(&nd[j], d->name);
         j++;
 
         if (name != NULL)
@@ -924,11 +1001,7 @@ struct netdriverdata *uaenet_tap_enumerate(const TCHAR *name)
         tap_nd[j].active = 1;
         tap_nd[j].driverdata = nullptr;
 
-        // Read MTU from sysfs
-        char mtu_path[256];
-        snprintf(mtu_path, sizeof(mtu_path), "/sys/class/net/%s/mtu", ent->d_name);
-        long mtu = read_sysfs_long(mtu_path);
-        tap_nd[j].mtu = (mtu > 0) ? (int)mtu : 1500;
+        uaenet_fill_ifinfo(&tap_nd[j], ent->d_name);
 
         tap_nd_count++;
         if (name != NULL)
